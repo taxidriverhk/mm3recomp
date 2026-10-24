@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Nothing derived from the game is committed. You supply your own dump.
+# ---------------------------------------------------------------------------
+
+# Game files (your unpacked retail disc)
+/game_files/
+/game_files
+*.xbe
+*.iso
+*.xiso
+
+# Generated C from the XBE (regenerate with regen.ps1)
+/src/recomp/gen/
+
+# Builds and snapshot executables (contain recompiled game code)
+build/
+/snapshots/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.dll
+
+# Run output: frame dumps, audio/vertex dumps, logs, captured stdout/stderr
+/frames/
+*.bmp
+*.wav
+*.raw
+*.log
+*.err
+*.out
+*.e
+/*.txt
+!/CMakeLists.txt
+*.bak
+*.bak2
+
+# Python / editors / OS
+__pycache__/
+*.pyc
+.venv/
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

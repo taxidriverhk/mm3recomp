@@ -1,0 +1,1581 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 7746ae3..1d199f1 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -1109,7 +1109,7 @@ static void apu_irq_stats_line(void)
+     uint64_t now;
+ 
+     if (s_irq_trace < 0)
+-        s_irq_trace = apu_env_on("RECOMP_APU_TRACE");
++        s_irq_trace = apu_env_on("RECOMP_APU_TRACE") || apu_env_on("RECOMP_APU_VOICES");
+     if (!s_irq_trace)
+         return;
+     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
+index 3ec56ca..9d0dee0 100644
+--- a/src/apu/apu_vp.c
++++ b/src/apu/apu_vp.c
+@@ -195,6 +195,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
+ 
+     d->regs[NV_PAPU_FEDECMETH] = method;
+     d->regs[NV_PAPU_FEDECPARAM] = argument;
++    {
++        static int fe_log = -1, fe_n;
++        if (fe_log < 0) fe_log = getenv("RECOMP_APU_FE") != NULL;
++        if (fe_log && fe_n < 800) {
++            fe_n++;
++            fprintf(stderr, "[APU-FE] #%d method=%04X arg=%08X curvoice=%04X\n", fe_n, method, argument,
++                    (unsigned)d->regs[NV_PAPU_FECV]);
++        }
++    }
+     unsigned int selected_handle, list;
+ 
+     switch (method) {
+@@ -774,7 +783,7 @@ static unsigned s_vstat_frames, s_vstat_secs;
+ static void vp_stat_init(void)
+ {
+     const char *e;
+-    s_vstat_on = apu_env_on("RECOMP_APU_TRACE");
++    s_vstat_on = apu_env_on("RECOMP_APU_TRACE") || apu_env_on("RECOMP_APU_VOICES");
+     e = getenv("RECOMP_APU_VOICE_DUMP");
+     if (e && *e) {
+         const char *path = getenv("RECOMP_APU_VOICE_DUMP_FILE");
+diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
+index 327f01d..3c7348a 100644
+--- a/src/kernel/nv2a_backend.h
++++ b/src/kernel/nv2a_backend.h
+@@ -28,6 +28,7 @@
+ #define NV2A_BACKEND_H
+ 
+ #include <stdint.h>
++#include "nv2a_combiner.h"
+ 
+ /* The colour surface being drawn into, in real (anti-aliased) pixels.
+  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
+@@ -80,6 +81,9 @@ typedef struct {
+      * that ignores these draws that pass over the whole surface. */
+     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
+     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
++    /* SET_ZMIN_MAX_CONTROL: bits 4-7 ZCLAMP_EN, 0 = cull (clip) geometry outside
++     * the near/far range, 1 = clamp its depth (D3D uses it for shadow volumes). */
++    uint32_t zmin_max_control;
+ } Nv2aRenderState;
+ 
+ typedef struct {
+@@ -89,6 +93,72 @@ typedef struct {
+     const Nv2aRenderState *state;
+ } Nv2aBatch;
+ 
++/* Extended batch data, for a back end that runs the register combiners itself
++ * (Nv2aBackend.draw_ext). Everything Nv2aBatch leaves out: both vertex colours,
++ * the fog factor, all four texture-coordinate sets, the combiner programme and
++ * the four texture stages. One Nv2aVertexExt per Nv2aBatch vertex.
++ *
++ * Texture coordinates are as the vertex programme produced them, in clip space
++ * (the back end interpolates them perspective-correct and divides by .w for the
++ * projective stage modes). A stage whose format is swizzled or DXT takes
++ * coordinates in [0,1] ("normalised"); a linear stage takes texels. */
++typedef struct {
++    float d0[4], d1[4];     /* diffuse and specular, r,g,b,a, unclamped */
++    float fog;              /* fog factor, 1 = unfogged */
++    float tex[4][4];
++} Nv2aVertexExt;
++
++typedef struct {
++    Nv2aTexture tex;        /* meaningful when valid */
++    uint32_t valid;         /* a texture is bound to this stage */
++    uint32_t cube;          /* cube map (only face 0 is decodable) */
++    uint32_t mode;          /* SET_SHADER_STAGE_PROGRAM mode, 0 = stage off */
++    uint32_t normalised;    /* coordinates in [0,1], not texels */
++} Nv2aStageInfo;
++
++/* A batch whose vertex program the back end runs itself (Nv2aBackend.vsh_gpu
++ * set): raw attributes instead of transformed vertices. Each distinct vertex
++ * is `stride` float4s, slot k holding the input given by inputs; an input
++ * whose slot[] is 0xFF has no array and reads imm[] (SET_VERTEX_DATA*).
++ * indices are a triangle list into those vertices, primitives already
++ * assembled (strip triangles alternately swapped to keep one winding).
++ * Everything after the program -- clamping, fog, the screen-to-clip
++ * conversion, clipping -- is the back end's, matching nv2a_vsh_run and
++ * the executor's CPU path. */
++typedef struct {
++    const float (*attrs)[4];
++    uint32_t nverts, stride;
++    uint8_t slot[16];
++    float imm[16][4];
++    const uint32_t *indices;
++    uint32_t nindices;
++    const uint32_t (*program)[4];   /* start slot .. FINAL */
++    uint32_t program_len, hash;
++    const float (*constants)[4];    /* c[0..191] */
++    uint32_t const_gen;             /* changes whenever a constant does */
++    float aa[2];                    /* surface pixels per program pixel */
++    uint32_t fog_enable, fog_mode;
++    float fog_param[2];
++} Nv2aVshBatch;
++
++typedef struct {
++    const Nv2aVertexExt *ext;       /* NULL for a vsh batch */
++    const Nv2aVshBatch *vsh;        /* set: run the program on the GPU */
++    uint32_t use_rc;        /* the title programmed the combiners: run them;
++                               otherwise draw stage 0 texel * diffuse */
++    Nv2aCombiner rc;
++    Nv2aStageInfo stage[4];
++    float fog_color[4];     /* r,g,b */
++    uint32_t clip_plane_mode;
++    uint32_t vsh_hash;      /* hash of the vertex programme (0: fixed function) */
++    uint32_t specular_enable; /* SET_SPECULAR_ENABLE: 0 = the combiners see no specular colour */
++    /* For the dot-product stage modes (texm3x3 water/reflection shaders):
++     * SET_DOT_RGBMAPPING (stage n's -1..1 mapping in bits 4(n-1)..+2) and
++     * SET_SHADER_OTHER_STAGE_INPUT (the stage whose texel stage n dots with:
++     * stage 2 in bit 20, stage 3 in bits 24-25). */
++    uint32_t dot_mapping, other_stage_input;
++} Nv2aBatchExt;
++
+ typedef struct {
+     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
+      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+@@ -96,17 +166,39 @@ typedef struct {
+                   uint32_t flags, uint32_t argb, uint32_t zstencil);
+     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
+     void (*flip)(void);
++    /* Optional. When set it is called instead of draw(), with the same batch
++     * plus the extended data. */
++    void (*draw_ext)(const Nv2aSurface *s, const Nv2aBatch *b,
++                     const Nv2aBatchExt *x);
++    /* Optional. Called on the executor's thread on every pass of the GPU
++     * loop, whether or not the title flips: a back end keeps its window
++     * responsive here and scans out what the 3D engine does not draw (the
++     * PVIDEO overlay that movies play through). */
++    void (*idle)(void);
++    /* Optional. Nonzero when the back end runs vertex programs itself: the
++     * executor then sends draw_ext an Nv2aBatchExt with vsh set (and
++     * b->vertices NULL, b->count = indices) instead of transforming on the
++     * CPU. Asked per batch; 0 for this one falls back to the CPU path. */
++    int (*vsh_gpu)(const uint32_t (*program)[4], uint32_t len, uint32_t hash);
+ } Nv2aBackend;
+ 
+ /* Register (or, with NULL, remove) the back end. Call before the title starts
+  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
+ void nv2a_backend_register(const Nv2aBackend *backend);
+ 
++/* Run the registered back end's idle hook, if any (the GPU loop calls this). */
++void nv2a_backend_idle(void);
++
+ /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
+  * Handles every format the executor can sample (swizzled, linear, DXT).
+  * Returns 0 if the format is not supported. */
+ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+ 
++/* Cube maps: bytes between faces, and a decode of face 0..5 (same layout as
++ * nv2a_backend_decode_texture). Face order is the NV2A's: +X -X +Y -Y +Z -Z. */
++uint32_t nv2a_backend_cube_face_stride(const Nv2aTexture *tex);
++int nv2a_backend_decode_cube_face(const Nv2aTexture *tex, uint32_t face, uint32_t *argb_out);
++
+ /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
+  * of the semaphore the title reads GPU progress from (for XDK D3D, the
+  * pointer at device+0x30). The executor writes each release there once it
+@@ -117,4 +209,8 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+  * the semaphore context DMA object through RAMIN. */
+ void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+ 
++/* Inside flip(): the guest address of the colour surface the executor presents
++ * (the biggest one drawn since the last flip, as its own window shows). */
++uint32_t nv2a_backend_flip_surface(void);
++
+ #endif /* NV2A_BACKEND_H */
+diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
+index a513bc7..fa8ccb5 100644
+--- a/src/kernel/nv2a_pb_exec.c
++++ b/src/kernel/nv2a_pb_exec.c
+@@ -334,6 +334,9 @@ static struct {
+     Nv2aCombiner rc;
+     int      rc_seen;
+     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
++    uint32_t specular_enable;           /* SET_SPECULAR_ENABLE (0x03B8) */
++    uint32_t dot_mapping;               /* SET_DOT_RGBMAPPING (0x1E74) */
++    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT (0x1E78) */
+     uint32_t alpha_test, alpha_func, alpha_ref;
+     uint32_t fog_enable, fog_mode, fog_color;
+     float    fog_param[2];
+@@ -774,12 +777,24 @@ static void surface_apply_clip(void)
+ /* ---- Render back end (nv2a_backend.h) ------------------------------- */
+ 
+ static const Nv2aBackend *s_backend;
++static uint32_t s_flip_surface_va;
++
++uint32_t nv2a_backend_flip_surface(void)
++{
++    return s_flip_surface_va;
++}
+ 
+ void nv2a_backend_register(const Nv2aBackend *backend)
+ {
+     s_backend = backend;
+ }
+ 
++void nv2a_backend_idle(void)
++{
++    if (s_backend && s_backend->idle)
++        s_backend->idle();
++}
++
+ static int backend_draws(void)
+ {
+     return s_backend && s_backend->draw;
+@@ -827,6 +842,7 @@ static void current_render_state(Nv2aRenderState *r)
+     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
+     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
+     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
++    r->zmin_max_control  = s_reg[0x1D78 / 4];        /* SET_ZMIN_MAX_CONTROL */
+ }
+ 
+ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+@@ -1135,6 +1151,7 @@ static uint32_t linear_twin(uint32_t fmt)
+     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
+     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
+     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
++    case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
+     default:   return fmt;                 /* already linear, or unhandled */
+     }
+ }
+@@ -1287,9 +1304,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
+         *argb = 0xFF000000u | (t << 16) | (t << 8) | t;
+         return 1;
+     }
+-    case 0x1F:                                      /* LIN_A8 */
++    case 0x1F:                                      /* LIN_A8: white, alpha = texel. (Colour 0, as xemu
++                                                     * has it, blacks out MM3's ground.) */
+         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
+         return 1;
++    case 0x20: {                                    /* LIN_A8L8: low byte luminance, high alpha */
++        uint32_t t = ((const uint16_t *)p)[u], l = t & 0xFF;
++        *argb = ((t >> 8) << 24) | (l << 16) | (l << 8) | l;
++        return 1;
++    }
+ 
+     /* 4:2:2 packed YUV, two texels per four bytes.
+      *
+@@ -1995,6 +2018,7 @@ static int s_xf_no_tex;
+  * dropped. */
+ #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
+ static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
++static Nv2aVertexExt *s_bext;    /* the same vertices' extended data, in step */
+ static uint32_t   s_bcount;
+ 
+ static Nv2aVertex *backend_slot(void)
+@@ -2002,12 +2026,24 @@ static Nv2aVertex *backend_slot(void)
+     if (!s_bverts
+         && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
+         return NULL;
++    if (!s_bext
++        && !(s_bext = (Nv2aVertexExt *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bext)))
++        return NULL;
+     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
+         return NULL;
+     return &s_bverts[s_bcount];
+ }
+ 
+-static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
++/* The extended data of the slot backend_slot() just returned. */
++static Nv2aVertexExt *backend_slot_ext(void)
++{
++    return &s_bext[s_bcount];
++}
++
++static float fog_factor(float d);
++
++static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o,
++                            Nv2aVertexExt *e)
+ {
+     float su = 1.0f, sv = 1.0f;
+ 
+@@ -2022,23 +2058,33 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+     o->diffuse = pack_color(v->d0);
+     o->u = v->tex[0][0] * su;
+     o->v = v->tex[0][1] * sv;
++    memcpy(e->d0, v->d0, sizeof e->d0);
++    memcpy(e->d1, v->d1, sizeof e->d1);
++    e->fog = fog_factor(v->fog[0]);
++    memcpy(e->tex, v->tex, sizeof e->tex);
+ }
+ 
+ /* `textured`: the batch carried texture coordinates, so the bound texture is
+  * part of it. */
++/* A batch whose program the back end runs (raster_batch_vsh_gpu): set for
++ * the one backend_flush that sends it. */
++static const Nv2aVshBatch *s_pending_vsh;
++
+ static void backend_flush(int textured)
+ {
+     Nv2aSurface surf;
+     Nv2aRenderState rs;
+     Nv2aTexture tex;
+     Nv2aBatch batch;
++    const Nv2aVshBatch *vsh = s_pending_vsh;
+ 
+-    if (!s_bcount)
++    s_pending_vsh = NULL;
++    if (!s_bcount && !vsh)
+         return;
+     current_surface(&surf);
+     current_render_state(&rs);
+-    batch.vertices = s_bverts;
+-    batch.count = s_bcount;
++    batch.vertices = vsh ? NULL : s_bverts;
++    batch.count = vsh ? vsh->nindices : s_bcount;
+     batch.texture = NULL;
+     batch.state = &rs;
+     if (textured && s_gpu.texs[0].valid) {
+@@ -2053,8 +2099,48 @@ static void backend_flush(int textured)
+         tex.filter = s_gpu.texs[0].filter;
+         batch.texture = &tex;
+     }
+-    s_backend->draw(&surf, &batch);
+-    s_gpu.tris_drawn += s_bcount / 3;
++    if (s_backend->draw_ext) {
++        Nv2aBatchExt x;
++        int st;
++        static int no_rc = -1;
++
++        if (no_rc < 0)
++            no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
++        memset(&x, 0, sizeof x);
++        x.ext = vsh ? NULL : s_bext;
++        x.vsh = vsh;
++        x.use_rc = s_gpu.rc_seen && !no_rc;
++        x.rc = s_gpu.rc;
++        x.clip_plane_mode = s_gpu.clip_plane_mode;
++        x.specular_enable = s_gpu.specular_enable;
++        x.dot_mapping = s_gpu.dot_mapping;
++        x.other_stage_input = s_gpu.other_stage_input;
++        x.vsh_hash = (s_gpu.xf_mode & 3) == 2 ? nv2a_vsh_program_hash() : 0;
++        nv2a_rc_unpack(s_gpu.fog_color, x.fog_color);
++        { float r = x.fog_color[2]; x.fog_color[2] = x.fog_color[0]; x.fog_color[0] = r; }
++        for (st = 0; st < 4; st++) {
++            const Texture *t = &s_gpu.texs[st];
++            Nv2aStageInfo *si = &x.stage[st];
++
++            si->mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F;
++            si->valid = t->valid && !(st == 0 && !textured);
++            si->cube = t->cube;
++            si->normalised = tex_size_from_format(t->color) ? 1 : 0;
++            si->tex.offset = t->offset;
++            si->tex.width  = t->width;
++            si->tex.height = t->height;
++            si->tex.pitch  = t->pitch;
++            si->tex.color  = t->color;
++            si->tex.addr_u = t->addr_u;
++            si->tex.addr_v = t->addr_v;
++            si->tex.levels = t->pitch ? 1 : t->levels;
++            si->tex.filter = t->filter;
++        }
++        s_backend->draw_ext(&surf, &batch, &x);
++    } else if (!vsh) {
++        s_backend->draw(&surf, &batch);
++    }
++    s_gpu.tris_drawn += batch.count / 3;
+     s_bcount = 0;
+     note_drawn();
+ }
+@@ -2097,6 +2183,25 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+             o[k].diffuse = vertex_color(ix[k]);
+             o[k].u = textured ? uv[k][0] : 0.0f;
+             o[k].v = textured ? uv[k][1] : 0.0f;
++            {
++                /* Extended data: the vertex colour and stage 0's coordinate,
++                 * back in the units the stage takes (uv is in texels). */
++                Nv2aVertexExt *e = &backend_slot_ext()[k];
++                float ru = o[k].u, rv = o[k].v;
++                int st;
++                nv2a_rc_unpack(o[k].diffuse, e->d0);
++                memset(e->d1, 0, sizeof e->d1);
++                e->fog = 1.0f;
++                if (tex_size_from_format(s_gpu.texs[0].color)
++                    && s_gpu.texs[0].width && s_gpu.texs[0].height) {
++                    ru /= (float)s_gpu.texs[0].width;
++                    rv /= (float)s_gpu.texs[0].height;
++                }
++                for (st = 0; st < 4; st++) {
++                    e->tex[st][0] = ru; e->tex[st][1] = rv;
++                    e->tex[st][2] = 0.0f; e->tex[st][3] = 1.0f;
++                }
++            }
+         }
+         s_bcount += 3;
+         return;
+@@ -2208,7 +2313,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
+     case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
+         return 1;
+     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
+-    case 0x1C: case 0x1D:
++    case 0x1C: case 0x1D: case 0x1A: case 0x20:
+         return 2;
+     default:
+         return 4;
+@@ -2233,6 +2338,23 @@ static uint32_t tex_face_stride(const Texture *t)
+     return (total + 127u) & ~127u;
+ }
+ 
++uint32_t nv2a_backend_cube_face_stride(const Nv2aTexture *tex)
++{
++    Texture t;
++    memset(&t, 0, sizeof t);
++    t.width = tex->width; t.height = tex->height; t.pitch = tex->pitch;
++    t.color = tex->color; t.levels = tex->levels;
++    return tex_face_stride(&t);
++}
++
++int nv2a_backend_decode_cube_face(const Nv2aTexture *tex, uint32_t face, uint32_t *argb_out)
++{
++    Nv2aTexture f = *tex;
++    f.offset += face * nv2a_backend_cube_face_stride(tex);
++    f.levels = 1;
++    return nv2a_backend_decode_texture(&f, argb_out);
++}
++
+ /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
+  * floats. An unusable stage reads white, so a missing texture multiplies
+  * through instead of blacking the pixel out. */
+@@ -2682,9 +2804,10 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     if (backend_draws()) {                     /* a back end rasterises */
+         Nv2aVertex *o = backend_slot();
+         if (o) {
+-            backend_from_xf(va, &o[0]);
+-            backend_from_xf(vb, &o[1]);
+-            backend_from_xf(vc, &o[2]);
++            Nv2aVertexExt *e = backend_slot_ext();
++            backend_from_xf(va, &o[0], &e[0]);
++            backend_from_xf(vb, &o[1], &e[1]);
++            backend_from_xf(vc, &o[2], &e[2]);
+             s_bcount += 3;
+         }
+         return;
+@@ -2927,15 +3050,445 @@ static void xf_set_viewport(void)
+     s_xf_o[2] = of[2];
+ }
+ 
++
++/* ---- vertex programs on the back end's GPU -------------------------------
++ *
++ * When the back end runs vertex programs itself (Nv2aBackend.vsh_gpu), a
++ * program batch is not interpreted here: each distinct vertex index gets its
++ * attributes fetched once (only the inputs that have an array; the rest are
++ * the SET_VERTEX_DATA values), and the primitives are assembled into a
++ * triangle list of those vertices with the same rules as the CPU path below.
++ * Clipping, fog and the rest happen on the GPU. RECOMP_VSH_CPU=1 keeps the
++ * interpreter. */
++#define GV_HASH 32768u
++static float (*s_gv_attrs)[4];
++static uint32_t *s_gv_tri;
++static uint32_t s_gv_key[GV_HASH], s_gv_val[GV_HASH], s_gv_stamp[GV_HASH], s_gv_gen;
++
++static int raster_batch_vsh_gpu(void)
++{
++    static int cpu = -1;
++    static Nv2aVshBatch vb;
++    const uint32_t (*prog)[4];
++    uint32_t len, hash, n = s_gpu.idx_count, i, a, k, nv = 0, nt = 0, stride = 0;
++    uint32_t *slot_of;
++
++    if (cpu < 0)
++        cpu = getenv("RECOMP_VSH_CPU") != NULL;
++    if (cpu || !s_backend || !s_backend->vsh_gpu || !s_backend->draw_ext || !batch_uses_program())
++        return 0;
++    prog = nv2a_vsh_program(&len);
++    if (!prog)
++        return 0;
++    hash = nv2a_vsh_program_hash();
++    if (!s_backend->vsh_gpu(prog, len, hash))
++        return 0;
++    if (!s_gv_attrs) {
++        s_gv_attrs = (float (*)[4])malloc((size_t)NV_MAX_INDICES * NV_VERTEX_ATTRS * sizeof *s_gv_attrs);
++        s_gv_tri = (uint32_t *)malloc((size_t)NV_MAX_INDICES * 6 * sizeof *s_gv_tri);
++        if (!s_gv_attrs || !s_gv_tri)
++            return 0;
++    }
++    memset(&vb, 0, sizeof vb);
++    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
++        if (s_gpu.attr[a].size)
++            vb.slot[a] = (uint8_t)stride++;
++        else
++            vb.slot[a] = 0xFF;
++        memcpy(vb.imm[a], s_gpu.imm_attr[a], sizeof vb.imm[a]);
++    }
++    /* Distinct vertices: s_gv_* maps a vertex index to its slot for this batch. */
++    slot_of = (uint32_t *)s_xf;                 /* per batch position -> vertex slot */
++    if (!slot_of && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
++        return 0;
++    slot_of = (uint32_t *)s_xf;
++    if (++s_gv_gen == 0) {
++        memset(s_gv_stamp, 0, sizeof s_gv_stamp);
++        s_gv_gen = 1;
++    }
++    for (i = 0; i < n; i++) {
++        uint32_t idx = s_gpu.idx[i], h = (idx * 2654435761u) >> 17, v;
++        for (;;) {
++            h &= GV_HASH - 1;
++            if (s_gv_stamp[h] != s_gv_gen) {
++                s_gv_stamp[h] = s_gv_gen;
++                s_gv_key[h] = idx;
++                v = s_gv_val[h] = nv++;
++                for (a = 0, k = 0; a < NV_VERTEX_ATTRS; a++)
++                    if (vb.slot[a] != 0xFF)
++                        fetch_attr(&s_gpu.attr[a], idx, s_gv_attrs[(size_t)v * stride + k++]);
++                break;
++            }
++            if (s_gv_key[h] == idx) {
++                v = s_gv_val[h];
++                break;
++            }
++            h++;
++        }
++        slot_of[i] = v;
++    }
++#define GV_TRI(p, q, r) (s_gv_tri[nt++] = slot_of[p], s_gv_tri[nt++] = slot_of[q], s_gv_tri[nt++] = slot_of[r])
++    switch (s_gpu.prim) {
++    case NV_PRIM_TRIANGLES:
++        for (i = 0; i + 2 < n; i += 3) GV_TRI(i, i + 1, i + 2);
++        break;
++    case NV_PRIM_TRIANGLE_STRIP:
++        for (i = 0; i + 2 < n; i++) {
++            if (i & 1) GV_TRI(i + 1, i, i + 2);
++            else       GV_TRI(i, i + 1, i + 2);
++        }
++        break;
++    case NV_PRIM_TRIANGLE_FAN:
++    case NV_PRIM_POLYGON:
++        for (i = 1; i + 1 < n; i++) GV_TRI(0, i, i + 1);
++        break;
++    case NV_PRIM_QUADS:
++        for (i = 0; i + 3 < n; i += 4) { GV_TRI(i, i + 1, i + 2); GV_TRI(i, i + 2, i + 3); }
++        break;
++    case NV_PRIM_QUAD_STRIP:
++        for (i = 0; i + 3 < n; i += 2) { GV_TRI(i, i + 1, i + 3); GV_TRI(i, i + 3, i + 2); }
++        break;
++    default:
++        break;
++    }
++#undef GV_TRI
++    s_gpu.batches_program++;
++    s_gpu.verts_program += n;
++    if (s_gpu.texs[0].valid)
++        note_texture_use();
++    if (!nt)
++        return 1;
++    {
++        /* RECOMP_VSH_WORLDLOG=<seconds>: for 300 ms from that time after the first
++         * GPU-transformed batch, one line per batch: program, index count, the
++         * world matrix rows c[109..111], and attribute v0 of the first vertex. */
++        static double at = -2, t0;
++        static LARGE_INTEGER fq;
++        LARGE_INTEGER now;
++        if (at == -2) {
++            const char *e = getenv("RECOMP_VSH_WORLDLOG");
++            at = e ? atof(e) : -1;
++            QueryPerformanceFrequency(&fq);
++            QueryPerformanceCounter(&now);
++            t0 = (double)now.QuadPart / (double)fq.QuadPart;
++        }
++        if (at >= 0) {
++            double t;
++            QueryPerformanceCounter(&now);
++            t = (double)now.QuadPart / (double)fq.QuadPart - t0;
++            if (t >= at && t < at + 30.0) {
++                const float (*c)[4] = nv2a_vsh_constants(NULL);
++                const float *p0 = stride ? s_gv_attrs[0] : vb.imm[0];
++                /* RECOMP_VSH_WORLDHASH=<h1>,<h2>,...: only those programs, the first 40
++                 * of their batches within 30 s, instead of every batch for 300 ms. */
++                static uint32_t wh[8];
++                static int nwh = -1, wlogged;
++                int pick = 0;
++                if (nwh < 0) {
++                    const char *e = getenv("RECOMP_VSH_WORLDHASH");
++                    nwh = 0;
++                    while (e && *e && nwh < 8) {
++                        wh[nwh++] = (uint32_t)strtoul(e, (char **)&e, 16);
++                        if (*e == ',') e++; else break;
++                    }
++                }
++                if (nwh) {
++                    int q;
++                    for (q = 0; q < nwh; q++)
++                        if (wh[q] == hash && wlogged < 40) { pick = 1; wlogged++; }
++                } else {
++                    pick = t < at + 0.3;
++                }
++                if (pick) {
++                    float mn[3] = { 1e30f, 1e30f, 1e30f }, mx[3] = { -1e30f, -1e30f, -1e30f };
++                    uint32_t q, j, s0 = vb.slot[0];
++                    if (s0 != 0xFF)
++                        for (q = 0; q < nv; q++)
++                            for (j = 0; j < 3; j++) {
++                                float f = s_gv_attrs[(size_t)q * stride + s0][j];
++                                if (f < mn[j]) mn[j] = f;
++                                if (f > mx[j]) mx[j] = f;
++                            }
++                    fprintf(stderr, "[WORLD] %08X n %u flip %u | %.3f %.3f %.3f %.1f | %.3f %.3f %.3f %.1f | %.3f %.3f %.3f %.1f | v0 %.3f %.3f %.3f"
++                            " | v0 box %.3f..%.3f %.3f..%.3f %.3f..%.3f type %u @%08X\n",
++                            hash, n, s_gpu.flips,
++                            c[109][0], c[109][1], c[109][2], c[109][3], c[110][0], c[110][1], c[110][2], c[110][3],
++                            c[111][0], c[111][1], c[111][2], c[111][3], p0[0], p0[1], p0[2],
++                            mn[0], mx[0], mn[1], mx[1], mn[2], mx[2], s_gpu.attr[0].type, s_gpu.attr[0].offset);
++                }
++                {
++                    /* RECOMP_VSH_WORLDSCAN=<hash>: once, find that batch's world position
++                     * (x and z of c[109].w / c[111].w) in guest RAM and print what is around
++                     * each hit: the object that owns the transform. */
++                    static uint32_t scan_hash;
++                    static int scan_set = -1, scanned;
++                    if (scan_set < 0) {
++                        const char *e = getenv("RECOMP_VSH_WORLDSCAN");
++                        scan_set = e != NULL;
++                        if (e) scan_hash = (uint32_t)strtoul(e, NULL, 16);
++                    }
++                    if (scan_set && !scanned && hash == scan_hash && getenv("RECOMP_VSH_WORLDSCAN_EXACT")) {
++                        /* The exact bytes of row c[109] anywhere in RAM: where the CPU built
++                         * the matrix it uploaded. */
++                        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++                        uint32_t a, hits = 0;
++                        int k;
++                        scanned = 1;
++                        for (a = 0x10000; a + 64 < 0x04000000u && hits < 16; a += 4) {
++                            const float *f = (const float *)(mem + a);
++                            if (memcmp(f, c[109], 12) != 0 && memcmp(f, c[110], 12) != 0)
++                                continue;
++                            hits++;
++                            fprintf(stderr, "[WSCAN] row c[%d] bytes at %08X:", memcmp(f, c[109], 12) ? 110 : 109, a);
++                            for (k = -32; k < 32; k++)
++                                fprintf(stderr, "%s%.4g", k % 8 ? " " : "\n[WSCAN]   ", f[k]);
++                            fprintf(stderr, "\n");
++                        }
++                        fprintf(stderr, "[WSCAN] %u exact hits\n", hits);
++                        {
++                            /* The extra rotation X (render = heading x X): rows (0,-1,0),
++                             * (0,0,-1), (1,0,0), or its transpose, in 3x3 or 3x4/4x4 layout. */
++                            static const float X[9] = { 0, -1, 0, 0, 0, -1, 1, 0, 0 };
++                            uint32_t xh = 0;
++                            for (a = 0x10000; a + 64 < 0x04000000u && xh < 24; a += 4) {
++                                const float *f = (const float *)(mem + a);
++                                int lay, tr, ok, i2, j2;
++                                for (lay = 3; lay <= 4; lay++)
++                                    for (tr = 0; tr < 2; tr++) {
++                                        ok = 1;
++                                        for (i2 = 0; i2 < 3 && ok; i2++)
++                                            for (j2 = 0; j2 < 3 && ok; j2++) {
++                                                float want = tr ? X[j2 * 3 + i2] : X[i2 * 3 + j2];
++                                                if (fabsf(f[i2 * lay + j2] - want) > 0.002f) ok = 0;
++                                            }
++                                        if (ok) {
++                                            xh++;
++                                            fprintf(stderr, "[XSCAN] X%s %dx at %08X:", tr ? "^T" : "", lay, a);
++                                            for (k = -16; k < 32; k++)
++                                                fprintf(stderr, "%s%.4g", k % 8 ? " " : "\n[XSCAN]   ", f[k]);
++                                            fprintf(stderr, "\n");
++                                        }
++                                    }
++                            }
++                            fprintf(stderr, "[XSCAN] %u hits\n", xh);
++                        }
++                    }
++                    if (scan_set && !scanned && hash == scan_hash) {
++                        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++                        float px = c[109][3], pz = c[111][3];
++                        uint32_t a, hits = 0;
++                        scanned = 1;
++                        for (a = 0x10000; a + 64 < 0x04000000u && hits < 24; a += 4) {
++                            const float *f = (const float *)(mem + a);
++                            int k;
++                            if (fabsf(f[0] - px) > 0.05f)
++                                continue;
++                            /* z within the next 8 floats: a position vector or a matrix row */
++                            for (k = 1; k <= 8; k++)
++                                if (fabsf(f[k] - pz) < 0.05f)
++                                    break;
++                            if (k > 8)
++                                continue;
++                            hits++;
++                            fprintf(stderr, "[WSCAN] x %.3f at %08X (z at +%d):", px, a, k * 4);
++                            for (k = -24; k < 24; k++)
++                                fprintf(stderr, "%s%.4g", k % 8 ? " " : "\n[WSCAN]   ", f[k]);
++                            fprintf(stderr, "\n");
++                        }
++                        fprintf(stderr, "[WSCAN] %u hits\n", hits);
++                    }
++                }
++            }
++        }
++    }
++    {
++        /* RECOMP_PEDPOSE=1: skinned pedestrian draws (bones at c[113+]): classify by
++         * bone 0's up row (c[114].y ~1 standing, ~0 lying), and for the first three
++         * of each kind dump the guest objects around their world position. */
++        static int on = -1, nlying, nstanding;
++        static float seenx[64]; static int nseen;
++        if (on < 0) on = getenv("RECOMP_PEDPOSE") != NULL;
++        if (on && (hash == 0x514A6CA7u || hash == 0xEEAF5AFCu || hash == 0x059ABB70u || hash == 0xD747A9E1u)) {
++            /* Run the skinned programme on the CPU with the view-projection (c[96..99]) and
++             * viewport (c[58], c[59]) set to identity, so oPos is the world position, and
++             * flag bodies whose world extent is flat rather than tall. */
++            static const float id4[4][4] = {{1,0,0,0},{0,1,0,0},{0,0,1,0},{0,0,0,1}};
++            static const float one[4] = {1,1,1,1}, zero[4] = {0,0,0,0};
++            static int nflat, ntall;
++            float save[6][4], in[NV2A_VSH_INPUTS][4], mn[3] = {1e30f, 1e30f, 1e30f}, mx[3] = {-1e30f, -1e30f, -1e30f};
++            const uint32_t rs[6] = {96, 97, 98, 99, 58, 59};
++            Nv2aVshOutput o;
++            uint32_t v, step = nv > 300 ? nv / 300 : 1;
++            int r, flat;
++            for (r = 0; r < 6; r++) memcpy(save[r], nv2a_vsh_constant(rs[r]), sizeof save[r]);
++            for (r = 0; r < 4; r++) nv2a_vsh_set_constant(96 + r, id4[r]);
++            nv2a_vsh_set_constant(58, one);
++            nv2a_vsh_set_constant(59, zero);
++            float vmn[3] = {1e30f, 1e30f, 1e30f}, vmx[3] = {-1e30f, -1e30f, -1e30f}, in0[4][4];
++            for (v = 0; v < nv; v += step) {
++                for (a = 0; a < NV2A_VSH_INPUTS; a++)
++                    memcpy(in[a], vb.slot[a] != 0xFF ? s_gv_attrs[(size_t)v * stride + vb.slot[a]] : vb.imm[a], sizeof in[a]);
++                if (v == 0) memcpy(in0, in, sizeof in0);
++                if (!nv2a_vsh_run((const float (*)[4])in, &o)) break;
++                for (r = 0; r < 3; r++) { if (o.pos[r] < mn[r]) mn[r] = o.pos[r]; if (o.pos[r] > mx[r]) mx[r] = o.pos[r]; }
++                for (r = 0; r < 3; r++) { if (in[0][r] < vmn[r]) vmn[r] = in[0][r]; if (in[0][r] > vmx[r]) vmx[r] = in[0][r]; }
++            }
++            for (r = 0; r < 6; r++) nv2a_vsh_set_constant(rs[r], save[r]);
++            flat = mx[1] - mn[1] < 0.8f * (mx[0] - mn[0] > mx[2] - mn[2] ? mx[0] - mn[0] : mx[2] - mn[2]);
++            if (flat ? nflat++ < 40 : ntall++ < 8) {
++                const float (*c)[4] = nv2a_vsh_constants(NULL);
++                fprintf(stderr, "[PEDBOX] %s %08X flip %u nv %u centre %.2f %.2f %.2f size %.2f %.2f %.2f"
++                        " world %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f c112 %.3f %.3f %.3f %.3f\n",
++                        flat ? "FLAT" : "TALL", hash, s_gpu.flips, nv, (mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2,
++                        mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2],
++                        c[109][0], c[109][1], c[109][2], c[109][3], c[110][0], c[110][1], c[110][2], c[110][3],
++                        c[111][0], c[111][1], c[111][2], c[111][3], c[112][0], c[112][1], c[112][2], c[112][3]);
++                fprintf(stderr, "[PEDBOX]   v0 box %.3f..%.3f %.3f..%.3f %.3f..%.3f types %u %u %u %u sizes %u %u %u %u\n",
++                        vmn[0], vmx[0], vmn[1], vmx[1], vmn[2], vmx[2], s_gpu.attr[0].type, s_gpu.attr[1].type,
++                        s_gpu.attr[2].type, s_gpu.attr[3].type, s_gpu.attr[0].size, s_gpu.attr[1].size, s_gpu.attr[2].size, s_gpu.attr[3].size);
++                for (r = 0; r < 4; r++)
++                    fprintf(stderr, "[PEDBOX]   vtx0 v%d %.3f %.3f %.3f %.3f\n", r, in0[r][0], in0[r][1], in0[r][2], in0[r][3]);
++                for (r = 0; r < 4; r++)
++                    fprintf(stderr, "[PEDBOX]   bone%d %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f\n", r,
++                            c[113 + 3 * r][0], c[113 + 3 * r][1], c[113 + 3 * r][2], c[113 + 3 * r][3],
++                            c[114 + 3 * r][0], c[114 + 3 * r][1], c[114 + 3 * r][2], c[114 + 3 * r][3],
++                            c[115 + 3 * r][0], c[115 + 3 * r][1], c[115 + 3 * r][2], c[115 + 3 * r][3]);
++            }
++        }
++        const float (*cc)[4] = nv2a_vsh_constants(NULL);
++        #define ROWN(r) (cc[r][0] * cc[r][0] + cc[r][1] * cc[r][1] + cc[r][2] * cc[r][2])
++        if (on && fabsf(ROWN(113) - 1) < 0.05f && fabsf(ROWN(114) - 1) < 0.05f && fabsf(ROWN(115) - 1) < 0.05f
++               && fabsf(ROWN(110) - 1) < 0.05f && fabsf(cc[109][3]) > 1.0f && fabsf(cc[111][3]) > 1.0f) {
++            const float (*c)[4] = cc;
++            /* Lying: bone 0 tipped over (pose), or the world matrix itself (the body's
++             * own transform) no longer has (0,1,0) as its up row. */
++            float up = c[114][1], px = c[109][3], pz = c[111][3];
++            int lying = fabsf(up) < 0.5f || fabsf(c[110][1]) < 0.5f, k, dup = 0;
++            if (lying && fabsf(c[110][1]) < 0.5f) {
++                static int nw;
++                if (nw++ < 40)
++                    fprintf(stderr, "[PEDPOSE] tilted world %08X at %.1f %.1f %.1f flip %u rows %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f\n",
++                            hash, px, c[110][3], pz, s_gpu.flips, c[109][0], c[109][1], c[109][2],
++                            c[110][0], c[110][1], c[110][2], c[111][0], c[111][1], c[111][2]);
++            }
++            if (lying) {
++                static int nl;
++                if (nl++ < 300 && nl % 10 == 1)
++                    fprintf(stderr, "[PEDPOSE] lying draw %08X at %.1f %.1f %.1f flip %u\n", hash, px, c[110][3], pz, s_gpu.flips);
++            }
++            for (k = 0; k < nseen; k++) if (fabsf(seenx[k] - px) < 0.5f) dup = 1;
++            if (!dup && nseen < 64 && ((lying && nlying < 6) || (!lying && nstanding < 6))) {
++                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++                uint32_t a, hits = 0;
++                seenx[nseen++] = px;
++                if (lying) nlying++; else nstanding++;
++                fprintf(stderr, "[PEDPOSE] %s ped %08X at %.2f %.2f %.2f flip %u bone0 rows %.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f\n",
++                        lying ? "LYING" : "STANDING", hash, px, c[110][3], pz, s_gpu.flips,
++                        c[113][0], c[113][1], c[113][2], c[114][0], c[114][1], c[114][2], c[115][0], c[115][1], c[115][2]);
++                /* The pedestrian render object (MM3: vtables 0x3785C8 / 0x3785C0 at +0 / +4,
++                 * position at +0x34) nearest this draw, and its state fields. */
++                for (a = 0x00400000; a + 0x600 < 0x04000000u && hits < 2; a += 4) {
++                    const uint32_t *w = (const uint32_t *)(mem + a);
++                    const float *f = (const float *)(mem + a);
++                    uint32_t ctl;
++                    if (w[0] != 0x003785C8u || w[1] != 0x003785C0u)
++                        continue;
++                    if (!(fabsf(f[13] - px) <= 1.5f) || !(fabsf(f[15] - pz) <= 1.5f))
++                        continue;
++                    hits++;
++                    fprintf(stderr, "[PEDPOSE]   render object %08X:", a);
++                    for (k = 0; k < 0x70 / 4; k++)
++                        fprintf(stderr, "%s%08X", k % 8 ? " " : "\n[PEDPOSE]     +", w[k]);
++                    fprintf(stderr, "\n[PEDPOSE]     +540: %08X %08X %08X", w[0x540 / 4], w[0x544 / 4], w[0x548 / 4]);
++                    ctl = w[0x54 / 4];
++                    if (ctl && ctl < 0x04000000u) {
++                        const uint32_t *cw = (const uint32_t *)(mem + ctl);
++                        fprintf(stderr, "\n[PEDPOSE]     anim controller %08X:", ctl);
++                        for (k = 0; k < 0x40; k++)
++                            fprintf(stderr, "%s%08X", k % 8 ? " " : "\n[PEDPOSE]       +", cw[k]);
++                    }
++                    fprintf(stderr, "\n");
++                }
++            }
++        }
++    }
++    vb.attrs = (const float (*)[4])s_gv_attrs;
++    vb.nverts = nv;
++    vb.stride = stride;
++    vb.indices = s_gv_tri;
++    vb.nindices = nt;
++    vb.program = prog;
++    vb.program_len = len;
++    vb.hash = hash;
++    vb.constants = nv2a_vsh_constants(&vb.const_gen);
++    vb.aa[0] = s_gpu.aa_sx;
++    vb.aa[1] = s_gpu.aa_sy;
++    vb.fog_enable = s_gpu.fog_enable;
++    vb.fog_mode = s_gpu.fog_mode;
++    vb.fog_param[0] = s_gpu.fog_param[0];
++    vb.fog_param[1] = s_gpu.fog_param[1];
++    xf_set_viewport();
++    s_xf_no_tex = 0;
++    s_pending_vsh = &vb;
++    backend_flush(1);
++    return 1;
++}
++
++/* RECOMP_PERF=1: where the executor's time goes, every 2 s of wall time --
++ * vertex programs, primitive assembly, the back end's draw, and the rest. */
++static int s_perf = -1;
++static LARGE_INTEGER s_perf_freq;
++static double s_perf_xf, s_perf_asm, s_perf_flush;
++static uint64_t s_perf_verts;
++
++static double perf_now(void)
++{
++    LARGE_INTEGER t;
++    QueryPerformanceCounter(&t);
++    return (double)t.QuadPart * 1000.0 / (double)s_perf_freq.QuadPart;
++}
++
++static void perf_report(void)
++{
++    static double t0, busy0;
++    double now;
++    if (s_perf < 0) {
++        s_perf = getenv("RECOMP_PERF") != NULL;
++        QueryPerformanceFrequency(&s_perf_freq);
++    }
++    if (!s_perf)
++        return;
++    now = perf_now();
++    if (!t0) { t0 = now; return; }
++    if (now - t0 >= 2000.0) {
++        double w = now - t0;
++        fprintf(stderr, "[PERF] %.0f ms: vsh %.0f ms (%.1f%%, %llu verts), assemble %.0f ms, backend %.0f ms, flips %u\n",
++                w, s_perf_xf, 100.0 * s_perf_xf / w, (unsigned long long)s_perf_verts,
++                s_perf_asm, s_perf_flush, s_gpu.flips);
++        s_perf_xf = s_perf_asm = s_perf_flush = 0;
++        s_perf_verts = 0;
++        t0 = now;
++        (void)busy0;
++    }
++}
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
++    double pt0 = 0, pt1 = 0, pt2 = 0;
+ 
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
++    perf_report();
++    if (s_perf) pt0 = perf_now();
++    if (raster_batch_vsh_gpu()) {
++        if (s_perf) { s_perf_flush += perf_now() - pt0; s_perf_verts += n; }
++        return;
++    }
+     for (i = 0; i < n; i++)
+         if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+             return;                                    /* no program loaded */
++    if (s_perf) { pt1 = perf_now(); s_perf_xf += pt1 - pt0; s_perf_verts += n; }
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+@@ -2993,11 +3546,32 @@ static void raster_batch_program(void)
+         }
+         /* Spread out: one every 20000 program batches, so a run that spends
+          * its first half in menus still traces the 3D scene. */
+-        if (left > 0 && n >= 3 && s_gpu.batches_program % 20000 == 0) {
++        static int zero_mode = -1;
++        int pick;
++        if (zero_mode < 0)
++            zero_mode = getenv("RECOMP_VSH_TRACE_ZERO") != NULL;
++        /* RECOMP_VSH_TRACE_ZERO: batches whose first vertex has black diffuse
++         * but visible alpha (the road), once every 500 such batches. */
++        {
++            /* RECOMP_VSH_TRACE_PROG=<hash>: every 100th batch of that programme. */
++            static uint32_t want;
++            static int want_set = -1;
++            if (want_set < 0) {
++                const char *e = getenv("RECOMP_VSH_TRACE_PROG");
++                want_set = e != NULL;
++                if (e) want = (uint32_t)strtoul(e, NULL, 16);
++            }
++            pick = want_set ? (nv2a_vsh_program_hash() == want && s_gpu.batches_program % 100 == 0)
++                 : zero_mode
++                ? (s_xf[0].d0[0] == 0.0f && s_xf[0].d0[1] == 0.0f && s_xf[0].d0[2] == 0.0f
++                   && s_xf[0].d0[3] > 0.1f && s_gpu.batches_program % 500 == 0)
++                : (s_gpu.batches_program % 20000 == 0);
++        }
++        if (left > 0 && n >= 3 && pick) {
+             float in[4];
+             left--;
+-            fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u\n", s_gpu.prim,
+-                    n, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2]);
++            fprintf(stderr, "[VTRACE] prim %u n %u idx %u %u %u prog %08X\n", s_gpu.prim,
++                    n, s_gpu.idx[0], s_gpu.idx[1], s_gpu.idx[2], nv2a_vsh_program_hash());
+             for (i = 0; i < NV_VERTEX_ATTRS; i++) {
+                 const VertexAttr *at = &s_gpu.attr[i];
+                 if (!at->size)
+@@ -3008,13 +3582,85 @@ static void raster_batch_program(void)
+                         at->size, at->stride, in[0], in[1], in[2], in[3]);
+             }
+             {
+-                static const uint32_t cs[] = {58, 59, 96, 97, 112, 113, 114, 115};
+-                for (i = 0; i < 8; i++) {
++                static uint32_t cs[48];
++                static int ncs;
++                if (!ncs) {
++                    static const uint32_t base[] = {58, 59, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
++                                                    116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 135, 138, 190, 191};
++                    for (ncs = 0; ncs < (int)(sizeof base / sizeof base[0]); ncs++)
++                        cs[ncs] = base[ncs];
++                }
++                for (i = 0; i < (uint32_t)ncs; i++) {
+                     const float *c = nv2a_vsh_constant(cs[i]);
+                     fprintf(stderr, "[VTRACE]   c[%u] %g %g %g %g%c", cs[i],
+                             c[0], c[1], c[2], c[3], 10);
+                 }
++                {
++                    /* MM3's D3D keeps a shadow of every constant it pushes at 0x3521F8
++                     * (hardware index * 16). Anything the interpreter holds differently
++                     * was lost or misrouted on its way through the pushbuffer. */
++                    const float *sh = (const float *)((const uint8_t *)xbox_GetMemoryOffset() + 0x3521F8);
++                    uint32_t ci, bad = 0;
++                    for (ci = 0; ci < NV2A_VSH_CONSTANTS; ci++) {
++                        const float *c = nv2a_vsh_constant(ci);
++                        if (ci >= 96 && memcmp(c, sh + ci * 4, 16) != 0) {
++                            if (bad < 24)
++                                fprintf(stderr, "[VTRACE]   MISMATCH c[%u] vsh %g %g %g %g shadow %g %g %g %g\n", ci,
++                                        c[0], c[1], c[2], c[3], sh[ci*4], sh[ci*4+1], sh[ci*4+2], sh[ci*4+3]);
++                            bad++;
++                        }
++                    }
++                    fprintf(stderr, "[VTRACE]   constants differing from the game's shadow: %u of %u\n", bad,
++                            (unsigned)NV2A_VSH_CONSTANTS);
++                }
+             }
++            {
++                uint32_t nz = 0, tot = n < 400 ? n : 400, k;
++                for (k = 0; k < tot; k++) {
++                    float cc[4];
++                    fetch_attr(&s_gpu.attr[3], s_gpu.idx[k], cc);
++                    if (cc[0] != 0.0f || cc[1] != 0.0f || cc[2] != 0.0f || cc[3] != 0.0f)
++                        nz++;
++                }
++                float c0[4];
++                fetch_attr(&s_gpu.attr[3], s_gpu.idx[0], c0);
++                {
++                    uint32_t nz1 = 0, k1;
++                    float cc1[4];
++                    for (k1 = 0; k1 < tot; k1++) {
++                        fetch_attr(&s_gpu.attr[1], s_gpu.idx[k1], cc1);
++                        if (cc1[0] != 0.0f) nz1++;
++                    }
++                    fprintf(stderr, "[VTRACE]   v1.x nonzero in %u of %u vertices\n", nz1, tot);
++                    if (s_gpu.inline_active) {
++                        uint32_t q;
++                        fprintf(stderr, "[VTRACE]   inline dwords %u raw:", (unsigned)s_gpu.inline_count);
++                        for (q = 0; q < 56 && q < s_gpu.inline_count; q++)
++                            fprintf(stderr, " %08X", ((const uint32_t *)s_gpu.inline_buf)[q]);
++                        fprintf(stderr, "\n");
++                    }
++                    if (s_gpu.attr[0].offset && !s_gpu.inline_active) {
++                        const uint8_t *vp = (const uint8_t *)xbox_GetMemoryOffset() + s_gpu.attr[0].offset;
++                        uint32_t q;
++                        fprintf(stderr, "[VTRACE]   raw vb:");
++                        for (q = 0; q < 120; q++)
++                            fprintf(stderr, " %02X", vp[q]);
++                        fprintf(stderr, "\n");
++                    }
++                }
++                fprintf(stderr, "[VTRACE]   v3[0] %g %g %g %g (size %u type %u)\n", c0[0], c0[1], c0[2], c0[3],
++                        s_gpu.attr[3].size, s_gpu.attr[3].type);
++                fprintf(stderr, "[VTRACE]   v3 nonzero in %u of %u vertices; out0 d0 %g %g %g %g d1 %g %g %g\n",
++                        nz, tot, s_xf[0].d0[0], s_xf[0].d0[1], s_xf[0].d0[2], s_xf[0].d0[3],
++                        s_xf[0].d1[0], s_xf[0].d1[1], s_xf[0].d1[2]);
++            }
++            fprintf(stderr, "[VTRACE]   fog enable %u mode 0x%X param %g %g color %08X; vert0 oFog %g %g %g %g -> factor %g\n",
++                    s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_param[0], s_gpu.fog_param[1], s_gpu.fog_color,
++                    s_xf[0].fog[0], s_xf[0].fog[1], s_xf[0].fog[2], s_xf[0].fog[3], fog_factor(s_xf[0].fog[0]));
++            for (i = 0; i < n && i < 24; i++)
++                fprintf(stderr, "[VTRACE]   vert%u idx %u pos %g %g d0 %.2f %.2f %.2f %.2f t0 %.3f %.3f\n", i,
++                        s_gpu.idx[i], s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].d0[0], s_xf[i].d0[1],
++                        s_xf[i].d0[2], s_xf[i].d0[3], s_xf[i].tex[0][0], s_xf[i].tex[0][1]);
+             for (i = 0; i < 3; i++)
+                 fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+                         s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+@@ -3040,8 +3686,14 @@ static void raster_batch_program(void)
+             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+         break;
+     case NV_PRIM_TRIANGLE_STRIP:
+-        for (i = 0; i + 2 < n; i++)
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++        /* Odd triangles of a strip wind the other way round; swap them so the
++         * winding is consistent (a back end that culls depends on it). */
++        for (i = 0; i + 2 < n; i++) {
++            if (i & 1)
++                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
++            else
++                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++        }
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -3065,8 +3717,10 @@ static void raster_batch_program(void)
+     }
+     /* The batch's triangles, all at once (see xf_queue_push). */
+     xf_queue_flush();
++    if (s_perf) { pt2 = perf_now(); s_perf_asm += pt2 - pt1; }
+     if (backend_draws())
+         backend_flush(!s_xf_no_tex);
++    if (s_perf) s_perf_flush += perf_now() - pt2;
+ }
+ 
+ static void raster_batch(void)
+@@ -3108,9 +3762,14 @@ static void raster_batch(void)
+                            vertex_color(s_gpu.idx[i]));
+         break;
+     case NV_PRIM_TRIANGLE_STRIP:
+-        for (i = 0; i + 2 < s_gpu.idx_count; i++)
+-            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+-                           vertex_color(s_gpu.idx[i]));
++        for (i = 0; i + 2 < s_gpu.idx_count; i++) {
++            if (i & 1)
++                raster_indexed(s_gpu.idx[i+1], s_gpu.idx[i], s_gpu.idx[i+2],
++                               vertex_color(s_gpu.idx[i]));
++            else
++                raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
++                               vertex_color(s_gpu.idx[i]));
++        }
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -3402,6 +4061,9 @@ static void draw_inline_array(void)
+         case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
+         case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
+         case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
++        case 1: case 5:
++                 bytes = 2 * s_gpu.attr[a].size;   break;  /* signed short */
++        case 6:  bytes = 4;                        break;  /* packed 11:11:10 */
+         default: bytes = 4 * s_gpu.attr[a].size;   break;
+         }
+         s_gpu.attr[a].offset = off;
+@@ -3912,9 +4574,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+         s_gpu.rc_seen = 1;
+         break;
+     case 0x1E70: s_gpu.rc.stage_program = param; break;
++    case 0x1E74: s_gpu.dot_mapping = param; break;
++    case 0x1E78: s_gpu.other_stage_input = param; break;
+     case 0x17F8: s_gpu.clip_plane_mode = param; break;
+ 
+     /* Alpha test and fog. */
++    case 0x03B8: s_gpu.specular_enable = param; break;  /* SET_SPECULAR_ENABLE */
+     case 0x0300: s_gpu.alpha_test = param; break;
+     case 0x033C: s_gpu.alpha_func = param; break;
+     case 0x0340: s_gpu.alpha_ref = param; break;
+@@ -4130,6 +4795,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+             }
+         }
+         s_gpu.drawn_stale = 1;
++        s_flip_surface_va = s_gpu.pitch
++            ? dma_resolve(s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset) : 0;
+         if (s_backend && s_backend->flip)
+             s_backend->flip();
+ 
+diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
+index e3a16e2..544fafc 100644
+--- a/src/kernel/nv2a_pb_scan.c
++++ b/src/kernel/nv2a_pb_scan.c
+@@ -466,12 +466,32 @@ int nv2a_pb_dma_walk(void)
+ static int s_in_call;
+ int nv2a_pb_scan_in_call(void) { return s_in_call; }
+ 
+-static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+-                                uint32_t *jumps, uint32_t *unknown)
++/* A top-level method whose parameters ran past the end of a segment (D3D
++ * streams long inline arrays across kicks): the rest arrive at the start of
++ * the next one. Dropping them read the remaining parameters as headers. */
++static uint32_t s_seg_left, s_seg_i, s_seg_method, s_seg_subch;
++static int      s_seg_noninc;
++
++/* *jump_to: where a top-level JUMP that ended the walk points (0: none). */
++static uint32_t pb_walk_segment_j(uint32_t va, uint32_t end_va, int in_call,
++                                  uint32_t *jumps, uint32_t *unknown, uint32_t *jump_to)
+ {
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+     uint32_t words = 0;
+ 
++    if (jump_to) *jump_to = 0;
++    if (!in_call) {
++        while (s_seg_left && va < end_va) {
++            uint32_t m = s_seg_noninc ? s_seg_method : s_seg_method + s_seg_i * 4;
++            note(s_seg_subch, m);
++            if (s_exec_enabled)
++                nv2a_pb_exec_method(s_seg_subch, m, *(const uint32_t *)(mem + va));
++            va += 4;
++            words++;
++            s_seg_i++;
++            s_seg_left--;
++        }
++    }
+     while (va < end_va && words < 0x100000u) {
+         uint32_t w = *(const uint32_t *)(mem + va);
+         va += 4;
+@@ -481,8 +501,10 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                              : (w & 0x1FFFFFFCu);
+             (*jumps)++;
+-            if (!in_call)
++            if (!in_call) {
++                if (jump_to) *jump_to = 0x80000000u | (target & 0x0FFFFFFFu);
+                 break;                        /* the ring: a jump ends it */
++            }
+             va = 0x80000000u | (target & 0x0FFFFFFFu);
+             end_va = va + 0x400000u;
+             continue;
+@@ -497,7 +519,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+                 uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                 s_tot_calls++;
+                 s_in_call = 1;
+-                words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
++                words += pb_walk_segment_j(sub, sub + 0x400000u, 1, jumps, unknown, NULL);
+                 s_in_call = 0;
+             }
+             continue;
+@@ -508,7 +530,8 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+             uint32_t method =  w & 0x1FFCu;
+             int noninc = (w & 0xE0000000u) == 0x40000000u;
+ 
+-            for (uint32_t i = 0; i < count && va < end_va; i++) {
++            uint32_t i;
++            for (i = 0; i < count && va < end_va; i++) {
+                 uint32_t m = noninc ? method : method + i * 4;
+                 note(subch, m);
+                 if (s_exec_enabled)
+@@ -517,6 +540,13 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+                 va += 4;
+                 words++;
+             }
++            if (i < count && !in_call) {          /* finished by the next kick */
++                s_seg_left = count - i;
++                s_seg_i = i;
++                s_seg_method = method;
++                s_seg_subch = subch;
++                s_seg_noninc = noninc;
++            }
+             continue;
+         }
+         (*unknown)++;
+@@ -524,6 +554,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+     return words;
+ }
+ 
++static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
++                                uint32_t *jumps, uint32_t *unknown)
++{
++    return pb_walk_segment_j(va, end_va, in_call, jumps, unknown, NULL);
++}
++
+ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+ {
+     uint32_t words, jumps = 0, unknown = 0;
+@@ -544,3 +580,39 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+     s_tot_jumps += jumps;
+     s_tot_segments++;
+ }
++
++/* PUT came back below the previous PUT: the ring wrapped. The commands from the
++ * previous PUT run up to the JUMP D3D wrote at the end of what it had queued,
++ * and carry on from the JUMP's target up to the new PUT. Scanning the previous
++ * PUT to the highest PUT ever seen, then the lowest PUT seen to the new one,
++ * dropped everything queued between the last kick and the JUMP (and anything
++ * below the lowest PUT): a draw and a render-target switch every wrap, which
++ * in MM3 is a frame with the HUD drawn into a 16x16 surface, or black blocks,
++ * every few seconds. Returns 0 (and says so, a few times) when no JUMP to at or
++ * below the new PUT turned up. */
++int nv2a_pb_scan_wrap(uint32_t last_va, uint32_t put_va)
++{
++    uint32_t words, jumps = 0, unknown = 0, target = 0;
++
++    if (!pb_walk_enabled())
++        return 1;
++    if (s_exec_enabled) {
++        extern void nv2a_pb_exec_walk_begin(void);
++        nv2a_pb_exec_walk_begin();
++    }
++    words = pb_walk_segment_j(last_va, last_va + 0x400000u, 0, &jumps, &unknown, &target);
++    if (!target || target > put_va) {
++        static unsigned nwarn;
++        if (nwarn++ < 8)
++            fprintf(stderr, "  [PB] ring wrap from 0x%08X to PUT 0x%08X: %s (0x%08X)\n", last_va, put_va,
++                    target ? "JUMP lands past PUT" : "no JUMP found", target);
++        s_tot_words += words;
++        return 0;
++    }
++    words += pb_walk_segment_j(target, put_va, 0, &jumps, &unknown, NULL);
++    s_tot_words += words;
++    s_tot_unknown += unknown;
++    s_tot_jumps += jumps;
++    s_tot_segments++;
++    return 1;
++}
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c1b48e4..7d3f5a8 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -39,6 +39,7 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
+ static uint32_t s_load_slot, s_load_word, s_start_slot;
+ static uint32_t s_const_load, s_const_word;
+ static uint32_t s_cxt_write;
++static uint32_t s_const_gen = 1;     /* bumped on every constant write */
+ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+ 
+ static int vsh_dump_enabled(void)
+@@ -78,14 +79,16 @@ void nv2a_vsh_set_constant_load(uint32_t index)
+ {
+     s_const_load = index;
+     s_const_word = 0;
+-    if (vsh_dump_enabled())
++    if (vsh_dump_enabled() && getenv("RECOMP_VSH_DUMP_CONSTS"))
+         fprintf(stderr, "  [VSH] constant load -> c[%u]\n", index);
+ }
+ 
+ void nv2a_vsh_constant_word(uint32_t word)
+ {
+-    if (s_const_load < NV2A_VSH_CONSTANTS)
++    if (s_const_load < NV2A_VSH_CONSTANTS) {
+         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
++        s_const_gen++;
++    }
+     else if (vsh_dump_enabled()) {
+         static int warned;
+         if (warned++ < 8)
+@@ -100,6 +103,20 @@ void nv2a_vsh_constant_word(uint32_t word)
+                     s_const[s_const_load][1], s_const[s_const_load][2],
+                     s_const[s_const_load][3]);
+     }
++    {
++        /* RECOMP_VSH_WATCH=<c index>: print every completed write to that constant. */
++        static int watch = -2, shown_w;
++        if (watch == -2) {
++            const char *e = getenv("RECOMP_VSH_WATCH");
++            watch = e ? atoi(e) : -1;
++        }
++        static float last_w[4];
++        if (watch >= 0 && s_const_word == 3 && s_const_load == (uint32_t)watch
++            && memcmp(last_w, s_const[watch], sizeof last_w) != 0 && shown_w++ < 400
++            && (memcpy(last_w, s_const[watch], sizeof last_w), 1))
++            fprintf(stderr, "  [VSHW] c[%d] = %.6g %.6g %.6g %.6g\n", watch, s_const[watch][0], s_const[watch][1],
++                    s_const[watch][2], s_const[watch][3]);
++    }
+     if (++s_const_word == 4) {
+         s_const_word = 0;
+         s_const_load++;
+@@ -108,8 +125,10 @@ void nv2a_vsh_constant_word(uint32_t word)
+ 
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4])
+ {
+-    if (index < NV2A_VSH_CONSTANTS)
++    if (index < NV2A_VSH_CONSTANTS) {
+         memcpy(s_const[index], v, sizeof s_const[index]);
++        s_const_gen++;
++    }
+ }
+ 
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+@@ -159,10 +178,23 @@ static void dis_src(char *b, size_t n, const uint32_t *ins, int which)
+     }
+ }
+ 
++uint32_t nv2a_vsh_program_hash(void)
++{
++    uint32_t h = 2166136261u, t;
++    int i;
++    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
++        for (i = 0; i < 4; i++)
++            h = (h ^ s_program[t][i]) * 16777619u;
++        if (field(s_program[t], 3, 0, 1))
++            break;
++    }
++    return h;
++}
++
+ static void dump_program(uint32_t start)
+ {
+     uint32_t s;
+-    fprintf(stderr, "  [VSH] program at slot %u:\n", start);
++    fprintf(stderr, "  [VSH] program at slot %u hash %08X:\n", start, nv2a_vsh_program_hash());
+     for (s = start; s < NV2A_VSH_SLOTS; s++) {
+         const uint32_t *ins = s_program[s];
+         char a[40], bb[40], c[40];
+@@ -190,8 +222,31 @@ const float *nv2a_vsh_constant(uint32_t index)
+ 
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
+ {
+-    if (index < NV2A_VSH_CONSTANTS && comp < 4)
++    if (index < NV2A_VSH_CONSTANTS && comp < 4) {
+         memcpy(&s_const[index][comp], &word, 4);
++        s_const_gen++;
++    }
++}
++
++const float (*nv2a_vsh_constants(uint32_t *gen))[4]
++{
++    if (gen)
++        *gen = s_const_gen;
++    return (const float (*)[4])s_const;
++}
++
++const uint32_t (*nv2a_vsh_program(uint32_t *len))[4]
++{
++    uint32_t t;
++    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++)
++        if (field(s_program[t], 3, 0, 1)) {
++            if (len)
++                *len = t - s_start_slot + 1;
++            return (const uint32_t (*)[4])s_program[s_start_slot];
++        }
++    if (len)
++        *len = 0;
++    return NULL;
+ }
+ 
+ /* ---- execution ----------------------------------------------------------- */
+@@ -277,7 +332,18 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
+     case 10: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? a.v[i] : b.v[i]; break;
+     case 11: for (i = 0; i < 4; i++) r.v[i] = a.v[i] < b.v[i] ? 1.0f : 0.0f; break;
+     case 12: for (i = 0; i < 4; i++) r.v[i] = a.v[i] >= b.v[i] ? 1.0f : 0.0f; break;
+-    case 13: *a0 = (int)floorf(a.v[0] + 0.001f); break;         /* arl */
++    case 13: {                                                  /* arl */
++        static int round_mode = -1;
++        /* MM3 stores its matrix/colour palette indices as bytes scaled by n/255 and
++         * relies on the conversion landing on the intended integer; a byte just under
++         * the integer (12 * 21/255 = 0.988) floors to the neighbour and scrambles the
++         * car. Its pedestrians instead encode bone row 3k as (2k+1)/255 * 127.5 = 3k + 0.5,
++         * which nearest rounds up into the next bone's rows (bodies lie flat). floor(x+0.25)
++         * serves both; RECOMP_VSH_ARL_FLOOR=1 restores xemu's floor(x+0.001). */
++        if (round_mode < 0) round_mode = getenv("RECOMP_VSH_ARL_FLOOR") == NULL;
++        *a0 = (int)floorf(a.v[0] + (round_mode ? 0.25f : 0.001f));
++        break;
++    }
+     default: break;
+     }
+     return r;
+@@ -332,16 +398,16 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ {
+     static int dump = -1;
+-    static uint32_t dumped[16];
++    static uint32_t dumped[512];
+     static int ndumped;
+     vec4 temp[12], opos;
+-    float outregs[13][4];
++    static float outregs[13][4];
+     int a0 = 0;
+     uint32_t s;
+ 
+     if (dump < 0)
+         dump = getenv("RECOMP_VSH_DUMP") != NULL;
+-    if (dump && ndumped < 16) {
++    if (dump && ndumped < 512) {
+         /* By content: titles reload different programs into the same slot. */
+         uint32_t h = 2166136261u, t;
+         int i, seen = 0;
+@@ -361,8 +427,38 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+ 
+     memset(temp, 0, sizeof temp);
+     memset(&opos, 0, sizeof opos);
+-    memset(outregs, 0, sizeof outregs);
++    {
++        /* RECOMP_VSH_KEEPOUT=1: an output component a programme never writes keeps the value an
++         * earlier vertex/programme left there, as the hardware's output registers do, instead of
++         * being zeroed. (Experiment: MM3's car glass writes oD1.yzw only.) */
++        static int keep = -1;
++        float saved[13][4];
++        if (keep < 0) keep = getenv("RECOMP_VSH_KEEPOUT") != NULL;
++        if (keep) memcpy(saved, outregs, sizeof saved);
++        memset(outregs, 0, sizeof outregs);
++        if (keep) memcpy(outregs[4], saved[4], sizeof saved[4]);
++    }
+     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
++    /* A programme that never writes oD0.rgb (MM3's terrain programmes write only
++     * its alpha) is drawn by the title as if the colour were white: the combiner
++     * multiplies the texture by it, and black would blank the whole terrain.
++     * RECOMP_VSH_DIFFUSE0=1 restores the old all-zero default. */
++    {
++        static int black = -1;
++        if (black < 0) black = getenv("RECOMP_VSH_DIFFUSE0") != NULL;
++        if (!black)
++            outregs[3][0] = outregs[3][1] = outregs[3][2] = 1.0f;
++    }
++    /* Likewise oFog: MM3's car programmes never write it, yet the title enables linear
++     * fog with bias 1 / scale 1 (factor = oFog.x) and blends by the fog factor in the
++     * final combiner. With oFog = 0 that is full (black) fog and the car is black;
++     * with 1 it is unfogged. RECOMP_VSH_FOG0=1 restores 0. */
++    {
++        static int fog0 = -1;
++        if (fog0 < 0) fog0 = getenv("RECOMP_VSH_FOG0") != NULL;
++        if (!fog0)
++            outregs[5][0] = 1.0f;
++    }
+     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
+      * a projective stage divides by q, and q = 0 would put every texel of an
+      * unwritten stage at infinity. */
+@@ -383,6 +479,24 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+             mres = run_mac(mac, a, b, c, &a0);
+         if (ilu)
+             ires = run_ilu(ilu, c);
++        {
++            /* RECOMP_VSH_ITRACE=<hash>: every slot of the first run of that programme (a0 after). */
++            static int want_set = -1, runs;
++            static uint32_t want;
++            if (want_set < 0) {
++                const char *e = getenv("RECOMP_VSH_ITRACE");
++                want_set = e != NULL;
++                if (e) want = (uint32_t)strtoul(e, NULL, 16);
++            }
++            if (want_set && s == s_start_slot && nv2a_vsh_program_hash() == want)
++                runs++;
++            if (want_set && runs == 40 && nv2a_vsh_program_hash() == want)
++                fprintf(stderr, "[ITRACE] %3u mac%u ilu%u a0=%d A %g %g %g %g | B %g %g %g %g | C %g %g %g %g"
++                        " => M %g %g %g %g I %g %g %g %g omask %X o%u\n", s, mac, ilu, a0,
++                        a.v[0], a.v[1], a.v[2], a.v[3], b.v[0], b.v[1], b.v[2], b.v[3],
++                        c.v[0], c.v[1], c.v[2], c.v[3], mres.v[0], mres.v[1], mres.v[2], mres.v[3],
++                        ires.v[0], ires.v[1], ires.v[2], ires.v[3], omask, oaddr);
++        }
+ 
+         if (mac && mac != 13 && mac_mask) {
+             float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
+@@ -401,10 +515,22 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+         if (omask) {
+             const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
+             if (!field(ins, 3, 11, 1)) {                  /* to c[] */
+-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
++                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
+                     write_masked(s_const[oaddr], src, omask);
++                    s_const_gen++;
++                }
+             } else if (oaddr == 0) {
+                 write_masked(opos.v, src, omask);
++            } else if (oaddr == 5) {
++                /* oFog: the hardware puts the most significant masked
++                 * component in x (xemu vsh-prog.c fog_mask_str), so a
++                 * program writing oFog.w still sets the fog distance. The
++                 * n masked components land in x.. in order, as xemu writes
++                 * them. */
++                int n = ((omask >> 3) & 1) + ((omask >> 2) & 1)
++                      + ((omask >> 1) & 1) + (omask & 1), k;
++                for (k = 0; k < n; k++)
++                    outregs[5][k] = src->v[k];
+             } else if (oaddr < 13) {
+                 write_masked(outregs[oaddr], src, omask);
+             }
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 8acb0af..3d2a7e8 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -57,5 +57,12 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
+  * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
+ void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
+ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
++uint32_t nv2a_vsh_program_hash(void);      /* of the program at the start slot */
++
++/* For a back end that runs programs on the GPU: c[0..191] and a counter that
++ * changes whenever any of them is written; the program from the start slot
++ * to its FINAL instruction (NULL, len 0 when there is none). */
++const float (*nv2a_vsh_constants(uint32_t *gen))[4];
++const uint32_t (*nv2a_vsh_program(uint32_t *len))[4];
+ 
+ #endif
+diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
+index b723a92..49161cc 100644
+--- a/src/kernel/xbox_memory_layout.c
++++ b/src/kernel/xbox_memory_layout.c
+@@ -1554,14 +1554,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                         } else if (last_put && put < last_put) {
+-                            if (put_hi > last_put)
+-                                nv2a_pb_scan_segment(
+-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+-                            if (put > put_lo)
+-                                nv2a_pb_scan_segment(
+-                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+-                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
++                            /* A wrap: follow D3D's JUMP from the old PUT round to the new
++                             * one (nv2a_pb_scan_wrap); the highest/lowest PUT seen are
++                             * not the ring's ends and lost commands every wrap.
++                             * RECOMP_PB_WRAP_OLD=1 keeps the old bounds. */
++                            extern int nv2a_pb_scan_wrap(uint32_t, uint32_t);
++                            static int old = -1;
++                            if (old < 0) old = getenv("RECOMP_PB_WRAP_OLD") != NULL;
++                            if (old) {
++                                if (put_hi > last_put)
++                                    nv2a_pb_scan_segment(
++                                        XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
++                                        XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
++                                if (put > put_lo)
++                                    nv2a_pb_scan_segment(
++                                        XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
++                                        XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
++                            } else {
++                                nv2a_pb_scan_wrap(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
++                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
++                            }
+                         }
+                     }
+                     /* Periodic, because what the title submits at init is not
+@@ -1637,6 +1649,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+                                + g_memory_offset) = GetTickCount();
+ 
++        /* The back end's window and the video overlay need service even
++         * while the title draws nothing (a movie plays through PVIDEO). */
++        {
++            extern void nv2a_backend_idle(void);
++            nv2a_backend_idle();
++        }
++
+         Sleep(0);  /* yield; the waiter is spinning on another core */
+     }
+     return 0;
+diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
+index bd00f3f..4d50416 100644
+--- a/src/usb/usb_gamepad.c
++++ b/src/usb/usb_gamepad.c
+@@ -275,6 +275,17 @@ static uint8_t synthetic_buttons(void)
+     if (!configured)
+         return 0;
+     now = (unsigned long)GetTickCount();
++    {
++        /* RECOMP_PAD_PRESS_UNTIL_MS=<n>: stop pulsing n ms after the first report. A
++         * Start pulse that goes on forever pauses a race as soon as there is one. */
++        static unsigned long until = (unsigned long)-2;
++        if (until == (unsigned long)-2) {
++            const char *e = getenv("RECOMP_PAD_PRESS_UNTIL_MS");
++            until = e ? strtoul(e, NULL, 0) : 0;
++        }
++        if (until && now - t0 > until)
++            return 0;
++    }
+     phase = (now - t0) % period_ms;
+     return (uint8_t)((phase < hold_ms) ? mask : 0u);
+ }
