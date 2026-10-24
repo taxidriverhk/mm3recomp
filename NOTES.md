@@ -440,13 +440,47 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     optional 4th value (repeat every N s); it only sees CPU-transformed draws (`RECOMP_VSH_CPU=1`, too slow to reach
     a race). Debug hooks used in generated code (provider/SetTransform/animation logs) were removed.
 
+34. **W-buffer, the haze pass, the loading screen, texture hashing (2026-10-24, runs `ld1`-`ld3`, `boot1`).**
+    - **MM3 w-buffers its scene.** SET_CONTROL0 (0x0290) = `0x00110001` on 36 scene programmes: bit 16
+      Z_PERSPECTIVE_ENABLE, so the NV2A stores and tests *w* (linear in distance), not z/w. The clip range
+      4415..2^24 is in w units (w ~ 43780 x metres: 0.1 m .. 383 m). We stored z/w (crowded near 1), so the
+      passes that read depth back as distance saturated a few metres out. Now `Nv2aRenderState.control0`
+      (toolkit) and a second pixel shader `PSW` writes `SV_Depth = SV_Position.w * zscale` for those draws
+      (`wbuffer_on`, `RECOMP_D3D11_WBUFFER=0` = z/w). Cost ~6 fps in the race (~47 vs ~53): SV_Depth turns
+      off early-Z.
+    - **The skipped "opaque depth read" of 21(f) is the distance haze** (`969115CF`, sp `000A621`: 2D on the
+      depth as LIN_L16, DOT_PRODUCT, DOT_ST into the 64x32 lookup `80762000`; final = lerp(t3 = scene, v0, t2)).
+      Drawn with z/w depth it gave exactly the user's screenshot: everything beyond ~30 m replaced by the
+      skyline backdrop with a hard horizontal edge across the road (`frames\ld2`). With the w-buffer it gives
+      the intended warm haze/dawn sky (`frames\ld3`), so it is drawn by default now (`RECOMP_D3D11_DEPTHREAD=0`
+      skips it). The alpha-mask pass (`969115CF` sp `006C621`) is a 24-triangle 3D mesh, LEQUAL, colour mask
+      alpha only, blend dst*src_alpha.
+    - **Near/far like xemu:** with SET_ZMIN_MAX_CONTROL near/far cull on and ZCLAMP_EN = CULL (MM3: 1), xemu
+      clamps depth but discards fragments outside the clip range (psh.c `depth_clipping`). The PS now does the
+      same (`cb.zclip`; compares w in w-buffer mode; far side +2^-16 slack) for draws that write colour;
+      colour-less draws (stencil shadow volumes) keep plain clamp. `RECOMP_D3D11_ZDISCARD=0` = clamp only.
+    - **Loading screen:** `D3320CDA` before each load is not a copy: combiner r0 = v0 x 1, final = r0, so it
+      fills the display buffer `801B0000` with white (it ignores the bound texture). The loader thread then
+      CPU-draws the "LOADING"/"PRESS" panel into that memory. Our white fill lived only in the host surface, so
+      the panel showed on black. `memory_frame` now writes the host surface back into guest memory once per
+      hand-over, only into pixels still black (`RECOMP_D3D11_MEMMERGE=0` = off; log `display memory ... takes
+      over`). No image file is opened during loading, so white + panel is what this code path produces; if the
+      user's reference shows artwork, it comes from somewhere else.
+    - **Texture hashing:** `guest_hash` now covers level 0 in the texture's own format
+      (`nv2a_backend_cube_face_stride` with levels = 1: DXT1 w*h/2) instead of w*h*4; no `re-decoded` lines in
+      `ld1` (`80624000` used to re-decode every frame). `RECOMP_D3D11_HASH_ARGB=1` = old size.
+    - Probes: `RECOMP_D3D11_LOWFLIP=<prefix>` (flips with <= 40 draws: draw list + stage-0 texture resolved or
+      not, guest memory at the flip surface as BMP; at a hand-over the previous flip's draws and every 640-wide
+      surface); `[D3D11] opaque depth read drawn/skipped` (log_batch once per programme).
+
 ## Open issues (2026-10-23, D3D11 back end)
 
 First pass done 2026-10-23 (runs `inv2`, `drv1`, `drv2`; driving script in that session's scratchpad: verify_ps.ps1
 plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "D:\Documents\Xbox Recompilation"`:
 `mm3recomp\game_files` is a junction to `M:\game_files` ("Cannot open XBE" otherwise).
 
-1. **Sky through geometry (user: "the cube map always shows").** Not found yet. The sky is a cube-map draw at the far
+1. **Sky through geometry (user: "the cube map always shows").** Found and fixed in Paris (item 34: w-buffer +
+   haze pass); Washington and dusk not re-checked. The sky is a cube-map draw at the far
    plane (`9EC67266`, stage 0 CUBEMAP, depth LEQUAL, no depth write, 3 blended passes). Every draw of a logged frame
    has the same clip range (4415..2^24), so a per-draw depth-scale mismatch is ruled out. Only capture so far:
    `frames\drv2\f00452.bmp`, the skyline backdrop over a building wall with the camera pushed into it after a crash
@@ -469,8 +503,8 @@ plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "
    SET_DOT_RGBMAPPING 0x1E74 and SET_SHADER_OTHER_STAGE_INPUT 0x1E78 in Nv2aBatchExt; DOT_STR_3D samples 2D at
    xy, bump-env modes sample unperturbed). `[D3D11] dot stages:` logs the first 12 such draws. Not yet verified on
    water: no run reached the river (only `969115CF` used these modes in the start area).
-3. **Flicker -- mostly resolved (user-confirmed 2026-10-23)** by the honest fence wait and the ring-wrap fix (a)
-   below; what remains is (b), seen only with the camera pushed into walls. Captured in `frames\drv1\f00775.bmp`: a huge black wedge from the top-left and the car's rear panel
+3. **Flicker -- resolved.** Mostly by the honest fence wait and the ring-wrap fix (a) below (user-confirmed
+   2026-10-23); the remaining class (b) no longer occurs (user-confirmed 2026-10-24). Captured in `frames\drv1\f00775.bmp`: a huge black wedge from the top-left and the car's rear panel
    missing for one frame; `RECOMP_D3D11_FRAMESTATS=1` (`[FSTAT]` per flip: batches, tris, dropped, presented rt)
    showed the same batch/triangle counts as its neighbours, so the draws ran with wrong data. Cause found:
    `sub_00344640` (D3D_BlockOnTime, recomp_manual.c) said "GPU always caught up", written before the executor
@@ -496,7 +530,7 @@ plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "
    from the old PUT through the JUMP to the new PUT, and a method whose parameters run past PUT is finished by the
    next kick instead of having its rest read as headers (`RECOMP_PB_WRAP_OLD=1` = old bounds; `[PB] ring wrap`
    warns if no JUMP is found -- none seen). `RECOMP_PB_WALK=dma` would also do it but can hang D3D (header there).
-   (b) **Open: whole-screen or wedge-shaped dark / orange (backdrop-coloured) frames**, mostly near walls, sometimes
+   (b) **No longer seen (user, 2026-10-24): whole-screen or wedge-shaped dark / orange (backdrop-coloured) frames**, mostly near walls, sometimes
    several frames in a row. Draw lists, inputs, render state and texture sources are identical to the neighbours;
    the scene is intact before and right after the grade (colour and alpha), and the damage starts later in the
    post chain. The orange is the backdrop pass `22CCA55E` (blend DST_ALPHA/1-DST_ALPHA, texture `80746000`), so
@@ -522,6 +556,8 @@ plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "
    that to the host controller (XInput on Windows) instead of dropping it.
 5. **Window aspect ratio.** The window/back buffer should keep the game's own aspect ratio (letterbox/pillarbox
    on resize) instead of stretching to the window size.
+6. **Anti-aliasing.** Add host-side AA to the D3D11 back end (e.g. MSAA render targets resolved before present,
+   with an env/config switch for the sample count).
 
 ## Next steps
 

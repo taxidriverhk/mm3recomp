@@ -58,6 +58,7 @@ static const char s_hlsl[] =
 "  uint4 fac0[2]; uint4 fac1[2];\n"
 "  uint4 dbg;\n"
 "  uint4 dotx;\n"
+"  float4 zclip;\n"
 "};\n"
 /* flags: bit0 run combiners, bit1 alpha test, bits4-7 alpha func;
  * dotx: SET_DOT_RGBMAPPING, SET_SHADER_OTHER_STAGE_INPUT */
@@ -265,8 +266,10 @@ static const char s_hlsl[] =
 "  }\n"
 "  return saturate(o);\n"
 "}\n"
-"float4 PS(VSOut i) : SV_Target {\n"
+"float4 ps_main(VSOut i) {\n"
 "  float4 c;\n"
+"  float zv = zclip.w != 0.0 ? i.pos.w * zscale : i.pos.z;\n"
+"  if (zclip.z != 0.0 && (zv < zclip.x || zv > zclip.y)) discard;\n"
 "  if (dbg.x != 0u) {\n"
 "    uint m = dbg.x;\n"
 "    if (m == 1u) return float4(i.d0.rgb, 1);\n"
@@ -303,6 +306,14 @@ static const char s_hlsl[] =
 "    if (!ok) discard;\n"
 "  }\n"
 "  return c;\n"
+"}\n"
+"float4 PS(VSOut i) : SV_Target { return ps_main(i); }\n"
+/* W-buffer (SET_CONTROL0 Z_PERSPECTIVE_ENABLE): the NV2A stores and tests w,
+ * linear in distance, not z/w. SV_Position.w is the guest w, interpolated
+ * perspective-correct; the clip range is in the same units. */
+"float4 PSW(VSOut i, out float dep : SV_Depth) : SV_Target {\n"
+"  dep = saturate(i.pos.w * zscale);\n"
+"  return ps_main(i);\n"
 "}\n"
 /* Fullscreen blit: one big triangle, no vertex buffer. */
 "struct BOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
@@ -360,6 +371,7 @@ typedef struct {
     uint32_t fac0[8], fac1[8];
     uint32_t dbg[4];
     uint32_t dotx[4];
+    float zclip[4];         /* x..y: depth range kept (0..1); z != 0: discard outside it */
 } CBData;
 
 /* One vertex as the GPU reads it. */
@@ -418,7 +430,7 @@ static ID3D11DeviceContext *s_ctx;
 static IDXGISwapChain *s_swap;
 static ID3D11RenderTargetView *s_back_rtv;
 static ID3D11VertexShader *s_vs, *s_bvs;
-static ID3D11PixelShader *s_ps, *s_bps, *s_dps, *s_ops;
+static ID3D11PixelShader *s_ps, *s_psw, *s_bps, *s_dps, *s_ops;
 static ID3D11Buffer *s_dcb, *s_ocb;
 /* PVIDEO overlay: the current video frame converted to BGRA. */
 static ID3D11Texture2D *s_vid_tex;
@@ -618,6 +630,13 @@ static int init_device(void)
         return 0;
     ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &s_vs);
     ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s_ps);
+    {
+        ID3DBlob *pswb = compile("PSW", "ps_5_0");
+        if (pswb) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pswb), ID3D10Blob_GetBufferSize(pswb), NULL, &s_psw);
+            ID3D10Blob_Release(pswb);
+        }
+    }
     ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(bvsb), ID3D10Blob_GetBufferSize(bvsb), NULL, &s_bvs);
     ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(bpsb), ID3D10Blob_GetBufferSize(bpsb), NULL, &s_bps);
     {
@@ -976,6 +995,17 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
         if (s_rt[i].va == t->offset && s_rt[i].srv)
             return s_rt[i].srv;
 
+    {
+        /* Hash only what the decode reads: level 0 in the texture's own format
+         * (a DXT1 texture is w*h/2 bytes, not w*h*4). RECOMP_D3D11_HASH_ARGB=1: old size. */
+        static int argb_size = -1;
+        if (argb_size < 0) argb_size = getenv("RECOMP_D3D11_HASH_ARGB") != NULL;
+        if (!argb_size) {
+            Nv2aTexture l0 = *t;
+            l0.levels = 1;
+            bytes = nv2a_backend_cube_face_stride(&l0);
+        }
+    }
     hash = guest_hash(t->offset, bytes);
     for (i = 0; i < s_tex_n; i++) {
         TexEntry *c = &s_tex[i];
@@ -1328,6 +1358,17 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 
 /* ---- back end entry points --------------------------------------------- */
 
+/* The draw's depth is w (SET_CONTROL0 Z_PERSPECTIVE_ENABLE). MM3 w-buffers its scene
+ * (clip range 4415..2^24 = 0.1..383 m in w units) and its haze / distance-mask passes
+ * read that depth back as distance; stored as z/w it saturates a few metres out and
+ * the backdrop replaced everything beyond. RECOMP_D3D11_WBUFFER=0: always z/w. */
+static int wbuffer_on(const Nv2aRenderState *rs)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("RECOMP_D3D11_WBUFFER"); on = !(e && e[0] == '0'); }
+    return on && s_psw && (rs->control0 & 0x00010000u) != 0;
+}
+
 static float depth_scale(const Nv2aRenderState *rs)
 {
     return rs->depth_max > 1.5f ? 1.0f / rs->depth_max : 1.0f;
@@ -1443,6 +1484,21 @@ static void thread_check(const char *who)
 static int s_bh_on;             /* RECOMP_D3D11_BHASH: fingerprint this frame's batches */
 static uint32_t s_bh_only;      /* ...only this vertex programme's (RECOMP_D3D11_BHASH=<hash>) */
 static int s_dumpwin;           /* inside the RECOMP_D3D11_DUMP_FROM/_FOR window */
+
+/* RECOMP_D3D11_LOWFLIP=<prefix>: for flips with few draws (loading screens, menus), at
+ * most every 2 s: each draw's target and stage-0 texture (and whether it resolved), and
+ * the guest memory at the flip surface as <prefix><flip>_mem.bmp -- what a CPU-drawn
+ * image there would look like on the hardware. */
+#define LF_MAX 64
+typedef struct {
+    uint32_t rt, w, h, vsh, tris, mode0, valid0, srv0, blend, cmask;
+    Nv2aTexture tex;
+} LowFlipDraw;
+static const char *s_lf_pre;
+static int s_lf_on, s_lf_n;
+static LowFlipDraw s_lf[LF_MAX], s_lf_prev[LF_MAX];
+static int s_lf_prev_n;
+static uint64_t s_lf_prev_flip;
 
 static uint32_t fnv_bytes(uint32_t h, const void *p, size_t n)
 {
@@ -2140,10 +2196,20 @@ static void be_draw_ext(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aBatc
              * intended picture. Blended depth reads (the alpha-mask passes) still run.
              * RECOMP_D3D11_DEPTHREAD=1 draws it anyway. */
             static int sdr = -1;
-            if (sdr < 0) sdr = getenv("RECOMP_D3D11_DEPTHREAD") == NULL;
-            if (sdr && rs->zeta_va && !rs->blend_enable && x->stage[0].valid
-                && x->stage[0].tex.offset == rs->zeta_va)
-                return;
+            if (sdr < 0) { const char *e = getenv("RECOMP_D3D11_DEPTHREAD"); sdr = e && e[0] == '0'; }
+            if (rs->zeta_va && !rs->blend_enable && x->stage[0].valid
+                && x->stage[0].tex.offset == rs->zeta_va) {
+                /* Say once per programme what the skip drops (or, with DEPTHREAD=1, draws). */
+                static uint32_t seen[8]; static int ns; int k, dup = 0;
+                for (k = 0; k < ns; k++) if (seen[k] == x->vsh_hash) dup = 1;
+                if (!dup && ns < 8) {
+                    seen[ns++] = x->vsh_hash;
+                    fprintf(stderr, "[D3D11] opaque depth read %s:\n", sdr ? "skipped" : "drawn");
+                    log_batch(s_draws_this_flip - 1, s, b, x);
+                }
+                if (sdr)
+                    return;
+            }
         }
         if (has_only && x->vsh_hash != only)
             return;
@@ -2194,6 +2260,24 @@ vertices_ready:
     cb.inv_half[1] = 2.0f / (float)s->height;
     cb.zscale = depth_scale(rs);
     cb.alpha_ref = (float)(rs->alpha_ref & 0xFF);
+    {
+        /* SET_ZMIN_MAX_CONTROL with near/far cull on and ZCLAMP_EN = CULL (MM3: 0x00000001):
+         * xemu clamps depth but discards fragments outside the clip range (psh.c,
+         * depth_clipping). With clamp alone a mesh crossing the near plane is clamped to
+         * depth 0 and passes every depth test -- MM3's distance mask (969115CF, LEQUAL,
+         * scales the scene alpha the backdrop is blended by) then cut a hard edge across
+         * the near scene. Draws that write no colour (stencil shadow volumes) keep plain
+         * clamp: clipping opens them (NOTES 32). RECOMP_D3D11_ZDISCARD=0: clamp only. */
+        static int zd = -1;
+        if (zd < 0) { const char *e = getenv("RECOMP_D3D11_ZDISCARD"); zd = !(e && e[0] == '0'); }
+        if (zd && x->vsh && (rs->zmin_max_control & 0xFu) && ((rs->zmin_max_control >> 4) & 0xFu) == 0
+            && (rs->color_mask & 0x01010101u)) {
+            cb.zclip[0] = rs->depth_min * cb.zscale;
+            cb.zclip[1] = rs->depth_max * cb.zscale * (1.0f + 1.0f / 65536.0f);   /* far-plane geometry stays */
+            cb.zclip[2] = 1.0f;
+        }
+        cb.zclip[3] = wbuffer_on(rs) ? 1.0f : 0.0f;
+    }
     {
         static int dbg = -1;
         if (dbg < 0) { const char *e = getenv("RECOMP_D3D11_DBG"); dbg = e ? atoi(e) : 0; }
@@ -2296,6 +2380,13 @@ vertices_ready:
             if (!smps[st]) smps[st] = s_samp_linear_clamp;
         }
     }
+    if (s_lf_on && s_lf_n < LF_MAX) {
+        LowFlipDraw *d = &s_lf[s_lf_n++];
+        d->rt = s->color_va; d->w = s->width; d->h = s->height; d->vsh = x->vsh_hash;
+        d->tris = b->count / 3; d->tex = x->stage[0].tex; d->mode0 = x->stage[0].mode;
+        d->valid0 = x->stage[0].valid; d->srv0 = srvs[0] != NULL || cubes[0] != NULL;
+        d->blend = rs->blend_enable; d->cmask = rs->color_mask;
+    }
     if (rs->alpha_test_enable) {
         uint32_t f = rs->alpha_func >= 0x200 && rs->alpha_func <= 0x207 ? rs->alpha_func - 0x200 : 7;
         cb.flags |= 2 | (f << 4);
@@ -2381,7 +2472,7 @@ vertices_ready:
             ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
         }
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-        ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(s_ctx, wbuffer_on(rs) ? s_psw : s_ps, NULL, 0);
         ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, bound);
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 5, 4, cubes);
@@ -2405,8 +2496,9 @@ vertices_ready:
                 for (k = 0; k < nseen; k++) if (seen[k].h == x->vsh_hash && seen[k].z == rs->zmin_max_control) break;
                 if (k == nseen && nseen < 48) {
                     seen[nseen].h = x->vsh_hash; seen[nseen].z = rs->zmin_max_control; nseen++;
-                    fprintf(stderr, "[D3D11] zmin_max_control %08X for vsh %08X (stencil %u, colour mask %08X): %s\n",
-                            rs->zmin_max_control, x->vsh_hash, rs->stencil_enable, rs->color_mask, clip ? "clip" : "clamp");
+                    fprintf(stderr, "[D3D11] zmin_max_control %08X for vsh %08X (stencil %u, colour mask %08X): %s, control0 %08X%s\n",
+                            rs->zmin_max_control, x->vsh_hash, rs->stencil_enable, rs->color_mask, clip ? "clip" : "clamp",
+                            rs->control0, wbuffer_on(rs) ? " (w-buffer)" : "");
                 }
             }
             ID3D11DeviceContext_RSSetState(s_ctx, get_rast(rs, clip && x->vsh != NULL));
@@ -3030,6 +3122,66 @@ static RT *memory_frame(void)
     va = 0x80000000u | (va & 0x03FFFFFFu);
     if ((va & 0x03FFFFFFu) + pitch * h > 0x04000000u)
         return NULL;
+    {
+        /* On the hardware the GPU's last frame is in this memory and the CPU draws over it
+         * (MM3's race loading screen: the image is the last flip's copy into the display
+         * buffer, the loader thread adds the bar). Ours lives in the host surface only, so
+         * once per hand-over write it back where the CPU has not drawn (still black).
+         * RECOMP_D3D11_MEMMERGE=0: guest memory as it is. */
+        static int on = -1;
+        static uint64_t merged_flip = (uint64_t)-1;
+        int i;
+        if (on < 0) { const char *e = getenv("RECOMP_D3D11_MEMMERGE"); on = !(e && e[0] == '0'); }
+        if (on && merged_flip != s_flip_count) {
+            merged_flip = s_flip_count;
+            for (i = 0; i < s_rt_n; i++)
+                if (s_rt[i].va == va && s_rt[i].tex && s_rt[i].w >= w && s_rt[i].h >= h && s_rt[i].color_draws)
+                    break;
+            if (i < s_rt_n) {
+                D3D11_TEXTURE2D_DESC td;
+                ID3D11Texture2D *st = NULL;
+                uint32_t x, n = 0;
+                ID3D11Texture2D_GetDesc(s_rt[i].tex, &td);
+                td.Usage = D3D11_USAGE_STAGING;
+                td.BindFlags = 0;
+                td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                td.MiscFlags = 0;
+                if (td.Format == DXGI_FORMAT_B8G8R8A8_UNORM && td.SampleDesc.Count == 1
+                    && SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) {
+                    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)s_rt[i].tex);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+                        for (y = 0; y < h; y++) {
+                            uint32_t *g = (uint32_t *)((uint8_t *)mem + va + (size_t)y * pitch);
+                            const uint32_t *hp = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
+                            for (x = 0; x < w; x++)
+                                if (!(g[x] & 0x00FFFFFFu)) { g[x] = hp[x]; n++; }
+                        }
+                        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+                    }
+                    ID3D11Texture2D_Release(st);
+                }
+                fprintf(stderr, "[D3D11] display memory %08X takes over at flip %llu: %u black pixels filled from the surface\n",
+                        va, (unsigned long long)s_flip_count, n);
+            }
+            if (s_lf_pre) {
+                /* LOWFLIP probe: the last flip's draws and every full-size surface at the hand-over. */
+                int k;
+                fprintf(stderr, "[LOWFLIP] hand-over after flip %llu (%d draws):\n", (unsigned long long)s_lf_prev_flip, s_lf_prev_n);
+                for (k = 0; k < s_lf_prev_n; k++) {
+                    const LowFlipDraw *d = &s_lf_prev[k];
+                    fprintf(stderr, "    d%d rt %08X %ux%u vsh %08X tris %u blend %u cm %08X st0 mode %u tex %08X %ux%u fmt %02X %s\n",
+                            k, d->rt, d->w, d->h, d->vsh, d->tris, d->blend, d->cmask, d->mode0,
+                            d->tex.offset, d->tex.width, d->tex.height, d->tex.color, d->srv0 ? "ok" : "NO TEXTURE");
+                }
+                for (k = 0; k < s_rt_n; k++)
+                    if (s_rt[k].tex && s_rt[k].w >= 640) {
+                        char path[MAX_PATH];
+                        snprintf(path, sizeof path, "%shandover%llu_%08X.bmp", s_lf_pre, (unsigned long long)s_flip_count, s_rt[k].va);
+                        write_rt_bmp(&s_rt[k], path);
+                    }
+            }
+        }
+    }
     if (!s_mem_rt.tex) {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
@@ -3142,6 +3294,62 @@ static void be_flip(void)
         s_clear_sig = 0;
         tris0 = s_tri_count;
         drop0 = s_batches_dropped;
+    }
+    {
+        static int init;
+        static uint64_t next_ms;
+        if (!init) { init = 1; s_lf_pre = getenv("RECOMP_D3D11_LOWFLIP"); }
+        if (s_lf_pre) {
+            uint64_t t = GetTickCount64();
+            if (s_lf_on && s_lf_n <= 40 && t >= next_ms) {
+                const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+                uint32_t fva = nv2a_backend_flip_surface(), fbpitch = 0, fb = xbox_GetDisplayFramebuffer(&fbpitch);
+                uint32_t va = 0x80000000u | ((fva ? fva : fb) & 0x03FFFFFFu), row, k, nz = 0;
+                char path[MAX_PATH];
+                FILE *f;
+                next_ms = t + 2000;
+                fprintf(stderr, "[LOWFLIP] flip %llu: %d draws, flip surface %08X, display fb %08X, present rt %08X\n",
+                        (unsigned long long)s_flip_count, s_lf_n, fva, fb, r ? r->va : 0);
+                for (k = 0; k < (uint32_t)s_lf_n; k++) {
+                    const LowFlipDraw *d = &s_lf[k];
+                    fprintf(stderr, "    d%u rt %08X %ux%u vsh %08X tris %u blend %u cm %08X st0 mode %u valid %u tex %08X %ux%u fmt %02X pitch %u lv %u %s\n",
+                            k, d->rt, d->w, d->h, d->vsh, d->tris, d->blend, d->cmask, d->mode0, d->valid0,
+                            d->tex.offset, d->tex.width, d->tex.height, d->tex.color, d->tex.pitch, d->tex.levels,
+                            d->srv0 ? "ok" : "NO TEXTURE");
+                }
+                if ((va & 0x03FFFFFFu) + 640u * 4u * 480u <= 0x04000000u) {
+                    for (k = 0; k < 640u * 480u; k += 97)
+                        if (((const uint32_t *)(mem + va))[k] & 0x00FFFFFFu) nz++;
+                    fprintf(stderr, "    guest memory at %08X: %u of %u sampled pixels non-black\n", va, nz, 640u * 480u / 97u + 1);
+                    snprintf(path, sizeof path, "%s%llu_mem.bmp", s_lf_pre, (unsigned long long)s_flip_count);
+                    f = fopen(path, "wb");
+                    if (f) {
+                        uint8_t bh[54];
+                        uint32_t v;
+                        memset(bh, 0, sizeof bh);
+                        bh[0] = 'B'; bh[1] = 'M';
+                        v = 54 + 640 * 480 * 4; memcpy(bh + 2, &v, 4);
+                        bh[10] = 54; bh[14] = 40;
+                        v = 640; memcpy(bh + 18, &v, 4);
+                        v = (uint32_t)-480; memcpy(bh + 22, &v, 4);
+                        bh[26] = 1; bh[28] = 32;
+                        fwrite(bh, 1, 54, f);
+                        for (row = 0; row < 480; row++)
+                            fwrite(mem + va + (size_t)row * 640 * 4, 4, 640, f);
+                        fclose(f);
+                    }
+                }
+                if (r && r->tex) {
+                    snprintf(path, sizeof path, "%s%llu_rt.bmp", s_lf_pre, (unsigned long long)s_flip_count);
+                    write_rt_bmp(r, path);
+                }
+            }
+            memcpy(s_lf_prev, s_lf, (size_t)s_lf_n * sizeof *s_lf);
+            s_lf_prev_n = s_lf_n;
+            s_lf_prev_flip = s_flip_count;
+            s_lf_on = 1;
+            s_lf_n = 0;
+        }
     }
     s_last_frame_batches = s_draws_this_flip;
     s_draws_this_flip = 0;
