@@ -479,8 +479,8 @@ First pass done 2026-10-23 (runs `inv2`, `drv1`, `drv2`; driving script in that 
 plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "D:\Documents\Xbox Recompilation"`:
 `mm3recomp\game_files` is a junction to `M:\game_files` ("Cannot open XBE" otherwise).
 
-1. **Sky through geometry (user: "the cube map always shows").** Found and fixed in Paris (item 34: w-buffer +
-   haze pass); Washington and dusk not re-checked. The sky is a cube-map draw at the far
+1. **Sky through geometry (user: "the cube map always shows").** Fixed (item 34: w-buffer + haze pass); seen
+   right in Paris (our runs) and Washington (user-confirmed 2026-10-24). The sky is a cube-map draw at the far
    plane (`9EC67266`, stage 0 CUBEMAP, depth LEQUAL, no depth write, 3 blended passes). Every draw of a logged frame
    has the same clip range (4415..2^24), so a per-draw depth-scale mismatch is ruled out. Only capture so far:
    `frames\drv2\f00452.bmp`, the skyline backdrop over a building wall with the camera pushed into it after a crash
