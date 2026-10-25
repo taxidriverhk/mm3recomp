@@ -460,6 +460,18 @@ static int s_blend_n, s_ds_n, s_rast_n, s_samp_n;
 static RT *s_present_rt;
 static uint64_t s_last_draw_ms;       /* GetTickCount64 at the last 3D draw */
 static uint64_t s_draw_count, s_flip_count, s_tri_count, s_tex_decodes, s_batches_dropped;
+/* RECOMP_D3D11_HITCH=<ms>: per flip, time spent decoding/uploading textures and compiling
+ * vertex programs; a [HITCH] line for every frame interval above <ms>. */
+static uint64_t s_hd_us, s_hc_us, s_hd_bytes;
+static uint32_t s_hd_n, s_hc_n;
+static uint64_t qpc_us(void)
+{
+    static LARGE_INTEGER f;
+    LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)(c.QuadPart * 1000000 / f.QuadPart);
+}
 static uint32_t s_clears_this_flip, s_clear_sig;     /* RECOMP_D3D11_FRAMESTATS */
 static uint64_t s_last_report_ms;
 static uint64_t s_draws_this_flip, s_last_frame_batches;
@@ -958,6 +970,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
     D3D11_SUBRESOURCE_DATA sr;
     ID3D11ShaderResourceView *srv = NULL;
     int mips = t->levels > 1 && t->width >= 2 && t->height >= 2;
+    uint64_t t_us;
 
     if (!t->width || !t->height || t->width > 4096 || t->height > 4096)
         return NULL;
@@ -1017,6 +1030,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
         return e->srv;
     }
 
+    t_us = qpc_us();
     argb = (uint32_t *)malloc((size_t)t->width * t->height * 4);
     if (!argb) return NULL;
     if (!nv2a_backend_decode_texture(t, argb)) {
@@ -1111,6 +1125,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
     e->offset = t->offset; e->w = t->width; e->h = t->height; e->color = t->color;
     e->pitch = t->pitch; e->levels = t->levels; e->hash = hash; e->srv = srv;
     e->last_used = s_draw_count;
+    s_hd_us += qpc_us() - t_us; s_hd_n++; s_hd_bytes += (uint64_t)t->width * t->height * 4;
     return srv;
 }
 
@@ -1129,6 +1144,7 @@ static ID3D11ShaderResourceView *get_cube_texture(const Nv2aTexture *t)
     ID3D11Texture2D *tex = NULL;
     ID3D11ShaderResourceView *srv = NULL;
     int slot = -1;
+    uint64_t t_us;
 
     if (!t->width || t->width != t->height || t->width > 1024)
         return NULL;
@@ -1141,6 +1157,7 @@ static ID3D11ShaderResourceView *get_cube_texture(const Nv2aTexture *t)
             slot = (int)i;
             break;
         }
+    t_us = qpc_us();
     argb = (uint32_t *)malloc((size_t)t->width * t->height * 4 * 6);
     if (!argb) return NULL;
     for (f = 0; f < 6; f++) {
@@ -1181,6 +1198,7 @@ static ID3D11ShaderResourceView *get_cube_texture(const Nv2aTexture *t)
     if (s_cube[slot].srv) ID3D11ShaderResourceView_Release(s_cube[slot].srv);
     s_cube[slot].offset = t->offset; s_cube[slot].w = t->width; s_cube[slot].color = t->color;
     s_cube[slot].hash = hash; s_cube[slot].srv = srv;
+    s_hd_us += qpc_us() - t_us; s_hd_n++; s_hd_bytes += (uint64_t)t->width * t->width * 24;
     return srv;
 }
 
@@ -1599,7 +1617,8 @@ typedef struct {
     float fogp[2], aa[2];
 } VshDrawCB;
 
-static struct { uint32_t hash; ID3D11VertexShader *vs; int failed; } s_vsh[MAX_VSH];
+/* state: 0 compiling (the executor runs the program on the CPU meanwhile), 1 ready, 2 failed. */
+static struct { uint32_t hash; ID3D11VertexShader *vs; volatile LONG state; } s_vsh[MAX_VSH];
 static int s_vsh_n;
 static ID3D11Buffer *s_attr_buf, *s_idx_buf, *s_vc_buf, *s_vd_buf;
 static ID3D11ShaderResourceView *s_attr_srv;
@@ -1872,54 +1891,191 @@ static ID3D11VertexShader *vsh_lookup(uint32_t hash)
     int i;
     for (i = 0; i < s_vsh_n; i++)
         if (s_vsh[i].hash == hash)
-            return s_vsh[i].failed ? NULL : s_vsh[i].vs;
+            return s_vsh[i].state == 1 ? s_vsh[i].vs : NULL;
     return NULL;
 }
 
-/* Nv2aBackend.vsh_gpu: can this program run on the GPU? Compiles it on first
- * sight. RECOMP_D3D11_VSH_DUMP=1 prints each generated shader. */
-static int be_vsh_gpu(const uint32_t (*prog)[4], uint32_t len, uint32_t hash)
+/* Compiled vertex programs, cached on disk (shader_cache\<HLSL hash>.cso) so a
+ * program compiles once, not once per run. */
+static uint64_t fnv64(const char *p)
 {
-    static int off = -1, dump = -1;
-    char *src;
+    uint64_t h = 14695981039346656037ull;
+    while (*p) h = (h ^ (uint8_t)*p++) * 1099511628211ull;
+    return h;
+}
+
+static void vsh_cache_path(char *out, size_t n, uint64_t key)
+{
+    snprintf(out, n, "shader_cache\\vsh_%016llX.cso", (unsigned long long)key);
+}
+
+static ID3D11VertexShader *vsh_cache_load(uint64_t key)
+{
+    char path[MAX_PATH];
+    FILE *f;
+    long sz;
+    void *buf;
+    ID3D11VertexShader *vs = NULL;
+    vsh_cache_path(path, sizeof path, key);
+    f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = sz > 0 ? malloc((size_t)sz) : NULL;
+    if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz)
+        ID3D11Device_CreateVertexShader(s_dev, buf, (SIZE_T)sz, NULL, &vs);
+    free(buf);
+    fclose(f);
+    return vs;
+}
+
+static void vsh_cache_store(uint64_t key, const void *code, size_t n)
+{
+    char path[MAX_PATH], tmp[MAX_PATH];
+    FILE *f;
+    CreateDirectoryA("shader_cache", NULL);
+    vsh_cache_path(path, sizeof path, key);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) return;
+    fwrite(code, 1, n, f);
+    fclose(f);
+    MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING);
+}
+
+/* One compile: HLSL -> bytecode -> shader, then the entry goes ready (or failed). */
+typedef struct { int slot; uint64_t key; char *src; uint32_t hash, len; int dump; } VshJob;
+
+static void vsh_compile_job(VshJob *j)
+{
     ID3DBlob *code = NULL, *err = NULL;
     ID3D11VertexShader *vs = NULL;
-    int i;
+    HRESULT hr = D3DCompile(j->src, strlen(j->src), "nv2a_vsh", NULL, NULL, "main", "vs_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
+    if (FAILED(hr))
+        fprintf(stderr, "[D3D11] vertex program %08X: %s\n", j->hash,
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+    else if (SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                                      ID3D10Blob_GetBufferSize(code), NULL, &vs)))
+        vsh_cache_store(j->key, ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code));
+    if (j->dump || !vs)
+        fprintf(stderr, "[D3D11] vertex program %08X (%u slots) as HLSL:\n%s\n", j->hash, j->len, j->src);
+    if (code) ID3D10Blob_Release(code);
+    if (err) ID3D10Blob_Release(err);
+    s_vsh[j->slot].vs = vs;
+    InterlockedExchange(&s_vsh[j->slot].state, vs ? 1 : 2);
+    free(j->src);
+    free(j);
+}
+
+/* Background compiles: one worker, jobs in arrival order. */
+#define VSH_JOBS 64
+static VshJob *s_vjobs[VSH_JOBS];
+static int s_vjob_head, s_vjob_tail;
+static CRITICAL_SECTION s_vjob_lock;
+static HANDLE s_vjob_event;
+
+static DWORD WINAPI vsh_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        VshJob *j = NULL;
+        WaitForSingleObject(s_vjob_event, INFINITE);
+        for (;;) {
+            EnterCriticalSection(&s_vjob_lock);
+            j = s_vjob_head != s_vjob_tail ? s_vjobs[s_vjob_head % VSH_JOBS] : NULL;
+            if (j) s_vjob_head++;
+            LeaveCriticalSection(&s_vjob_lock);
+            if (!j) break;
+            vsh_compile_job(j);
+        }
+    }
+    return 0;
+}
+
+static int vsh_queue(VshJob *j)
+{
+    static int started;
+    int ok = 0;
+    if (!started) {
+        started = 1;
+        InitializeCriticalSection(&s_vjob_lock);
+        s_vjob_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (s_vjob_event)
+            CloseHandle(CreateThread(NULL, 0, vsh_worker, NULL, 0, NULL));
+    }
+    if (!s_vjob_event)
+        return 0;
+    EnterCriticalSection(&s_vjob_lock);
+    if (s_vjob_tail - s_vjob_head < VSH_JOBS) {
+        s_vjobs[s_vjob_tail++ % VSH_JOBS] = j;
+        ok = 1;
+    }
+    LeaveCriticalSection(&s_vjob_lock);
+    if (ok) SetEvent(s_vjob_event);
+    return ok;
+}
+
+/* Nv2aBackend.vsh_gpu: can this program run on the GPU? On first sight the
+ * HLSL is generated and the shader loaded from the disk cache; failing that
+ * it compiles in the background (30-70 ms each, 200 ms when objects with three
+ * new programs stream in -- NOTES 35) and the executor runs the program on the
+ * CPU until it is ready. RECOMP_D3D11_VSH_SYNC=1 compiles on the spot, as
+ * before; RECOMP_D3D11_VSH_DUMP=1 prints each generated shader. */
+static int be_vsh_gpu(const uint32_t (*prog)[4], uint32_t len, uint32_t hash)
+{
+    static int off = -1, dump = -1, sync = -1;
+    char *src;
+    uint64_t c_us, key;
+    VshJob *j;
+    int i, slot;
 
     thread_check("vsh_gpu");
     if (off < 0) {
         off = getenv("RECOMP_D3D11_VSH_CPU") != NULL;
         dump = getenv("RECOMP_D3D11_VSH_DUMP") != NULL;
+        sync = getenv("RECOMP_D3D11_VSH_SYNC") != NULL;
     }
     if (off || !ensure_init() || !vsh_buffers())
         return 0;
     for (i = 0; i < s_vsh_n; i++)
         if (s_vsh[i].hash == hash)
-            return !s_vsh[i].failed;
+            return s_vsh[i].state == 1;
     if (s_vsh_n == MAX_VSH)
         return 0;
-    src = vsh_generate(prog, len);
-    if (src) {
-        HRESULT hr = D3DCompile(src, strlen(src), "nv2a_vsh", NULL, NULL, "main", "vs_5_0",
-                                D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
-        if (FAILED(hr))
-            fprintf(stderr, "[D3D11] vertex program %08X: %s\n", hash,
-                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
-        else
-            ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
-                                            ID3D10Blob_GetBufferSize(code), NULL, &vs);
-        if (dump || !vs)
-            fprintf(stderr, "[D3D11] vertex program %08X (%u slots) as HLSL:\n%s\n", hash, len, src);
-        if (code) ID3D10Blob_Release(code);
-        if (err) ID3D10Blob_Release(err);
-        free(src);
-    }
-    s_vsh[s_vsh_n].hash = hash;
-    s_vsh[s_vsh_n].vs = vs;
-    s_vsh[s_vsh_n].failed = vs == NULL;
+    c_us = qpc_us();
+    slot = s_vsh_n;
+    s_vsh[slot].hash = hash;
+    s_vsh[slot].vs = NULL;
+    s_vsh[slot].state = 0;
     s_vsh_n++;
     s_vsh_compiles++;
-    return vs != NULL;
+    src = vsh_generate(prog, len);
+    if (!src) {
+        s_vsh[slot].state = 2;
+        return 0;
+    }
+    key = fnv64(src);
+    s_vsh[slot].vs = vsh_cache_load(key);
+    if (s_vsh[slot].vs) {
+        if (dump)
+            fprintf(stderr, "[D3D11] vertex program %08X (%u slots, cached) as HLSL:\n%s\n", hash, len, src);
+        free(src);
+        s_vsh[slot].state = 1;
+        s_hc_us += qpc_us() - c_us;
+        return 1;
+    }
+    j = (VshJob *)malloc(sizeof *j);
+    if (!j) { free(src); s_vsh[slot].state = 2; return 0; }
+    j->slot = slot; j->key = key; j->src = src; j->hash = hash; j->len = len; j->dump = dump;
+    if (sync || !vsh_queue(j)) {
+        vsh_compile_job(j);
+        s_hc_us += qpc_us() - c_us; s_hc_n++;
+        return s_vsh[slot].state == 1;
+    }
+    s_hc_us += qpc_us() - c_us;
+    return 0;
 }
 
 /* Upload a vsh batch's attributes, indices and constants and bind its vertex
@@ -2299,12 +2455,18 @@ vertices_ready:
     cb.dotx[0] = x->dot_mapping;
     cb.dotx[1] = x->other_stage_input;
     {
-        /* The first few draws with a dependent (dot-product / bump) stage: MM3's water. */
+        /* Draws with a dependent (dot-product / bump) stage, once per (programme, stage
+         * program): MM3's water, which the haze/mask passes no longer crowd out of the log. */
+        static struct { uint32_t vsh, sp; } seen[48];
         static int nlog;
         uint32_t k;
+        int q;
         for (k = 1; k < 4 && x->use_rc; k++)
             if (((x->rc.stage_program >> (k * 5)) & 31u) >= 6u) break;
-        if (k < 4 && nlog < 12) {
+        for (q = 0; k < 4 && q < nlog; q++)
+            if (seen[q].vsh == x->vsh_hash && seen[q].sp == x->rc.stage_program) break;
+        if (k < 4 && q == nlog && nlog < 48) {
+            seen[nlog].vsh = x->vsh_hash; seen[nlog].sp = x->rc.stage_program;
             nlog++;
             fprintf(stderr, "[D3D11] dot stages: flip %llu vsh %08X sp %07X dotmap %08X input %08X tris %u"
                     " tex %08X/%08X/%08X/%08X cube %u%u%u%u\n", (unsigned long long)s_flip_count, x->vsh_hash,
@@ -3350,6 +3512,23 @@ static void be_flip(void)
             s_lf_on = 1;
             s_lf_n = 0;
         }
+    }
+    {
+        static long lim = -2;
+        static uint64_t last_us;
+        uint64_t t = qpc_us();
+        if (lim == -2) { const char *e = getenv("RECOMP_D3D11_HITCH"); lim = e ? atol(e) : -1; }
+        if (last_us) {
+            extern void mm3_sampler_frame(double ms);
+            mm3_sampler_frame((t - last_us) / 1000.0);
+        }
+        if (lim >= 0 && last_us && t - last_us > (uint64_t)lim * 1000u)
+            fprintf(stderr, "[HITCH] flip %llu: %.1f ms, %llu draws; textures %u (%.1f ms, %.1f MB), vsh compiles %u (%.1f ms)\n",
+                    (unsigned long long)s_flip_count, (t - last_us) / 1000.0, (unsigned long long)s_draws_this_flip,
+                    s_hd_n, s_hd_us / 1000.0, s_hd_bytes / 1048576.0, s_hc_n, s_hc_us / 1000.0);
+        last_us = t;
+        s_hd_us = s_hc_us = s_hd_bytes = 0;
+        s_hd_n = s_hc_n = 0;
     }
     s_last_frame_batches = s_draws_this_flip;
     s_draws_this_flip = 0;

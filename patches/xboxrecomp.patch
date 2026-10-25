@@ -188,7 +188,7 @@ index 327f01d..1d489eb 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..5c524fd 100644
+index a513bc7..419d312 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -334,6 +334,9 @@ static struct {
@@ -1071,7 +1071,24 @@ index a513bc7..5c524fd 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3402,6 +4062,9 @@ static void draw_inline_array(void)
+@@ -3212,8 +3872,14 @@ static void draw_primitive(void)
+     if (!s_gpu.prim || !s_gpu.idx_count)
+         return;
+     s_gpu.draws++;
+-    if ((s_gpu.draws % 200) == 0)
+-        fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
++    {
++        /* A line per 200 draws is ~70k lines a race, all under the CRT's
++         * stderr lock that the title's own threads log through. Opt-in. */
++        static int drawlog = -1;
++        if (drawlog < 0) drawlog = getenv("RECOMP_GPU_DRAWLOG") != NULL;
++        if (drawlog && (s_gpu.draws % 200) == 0)
++            fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
++    }
+     s_gpu.verts += s_gpu.idx_count;
+ 
+     /* How many batches carry coordinates at all, and what range they span.
+@@ -3402,6 +4068,9 @@ static void draw_inline_array(void)
          case 0:  bytes = 4;                        break;  /* D3DCOLOR   */
          case 2:  bytes = 4 * s_gpu.attr[a].size;   break;  /* float      */
          case 4:  bytes = s_gpu.attr[a].size;       break;  /* ubyte norm */
@@ -1081,7 +1098,7 @@ index a513bc7..5c524fd 100644
          default: bytes = 4 * s_gpu.attr[a].size;   break;
          }
          s_gpu.attr[a].offset = off;
-@@ -3912,9 +4575,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3912,9 +4581,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          s_gpu.rc_seen = 1;
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
@@ -1094,7 +1111,7 @@ index a513bc7..5c524fd 100644
      case 0x0300: s_gpu.alpha_test = param; break;
      case 0x033C: s_gpu.alpha_func = param; break;
      case 0x0340: s_gpu.alpha_ref = param; break;
-@@ -4130,6 +4796,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4130,6 +4802,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              }
          }
          s_gpu.drawn_stale = 1;
@@ -1509,7 +1526,7 @@ index 8acb0af..3d2a7e8 100644
  
  #endif
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index b723a92..49161cc 100644
+index b723a92..5273a24 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -1554,14 +1554,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1547,7 +1564,33 @@ index b723a92..49161cc 100644
                          }
                      }
                      /* Periodic, because what the title submits at init is not
-@@ -1637,6 +1649,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1571,15 +1583,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+                      * when RECOMP_FB_DUMP writes a frame, and stepping a
+                      * scripted pad through a menu needs a picture per
+                      * press rather than one every ten seconds. */
++                    /* Only when asked for (RECOMP_NV2A_TRACE, RECOMP_PB_SCAN or
++                     * RECOMP_PB_REPORT_MS): RECOMP_PB_EXEC alone is the normal
++                     * way to run a title, and the report runs on this thread --
++                     * the one feeding the GPU -- so each one stalled a race for
++                     * 150-750 ms every ten seconds (MM3, NOTES 35). */
+                     static long report_ms = -1;
++                    static int report_on;
+                     if (report_ms < 0) {
+                         const char *e = getenv("RECOMP_PB_REPORT_MS");
+                         report_ms = e ? atol(e) : 10000;
+                         if (report_ms < 100) report_ms = 100;
++                        report_on = e || getenv("RECOMP_NV2A_TRACE") || getenv("RECOMP_PB_SCAN");
+                     }
+-                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
++                    if (s_nv2a_trace && report_on && now_ms - last_report > (uint64_t)report_ms) {
++                        DWORD t0 = GetTickCount();
+                         last_report = now_ms;
+                         nv2a_pb_scan_report();
++                        fprintf(stderr, "[PB] report took %lu ms\n", (unsigned long)(GetTickCount() - t0));
+                     }
+                 }
+                 /* Consumed, now that it has actually been executed. */
+@@ -1637,6 +1658,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                 + g_memory_offset) = GetTickCount();
  

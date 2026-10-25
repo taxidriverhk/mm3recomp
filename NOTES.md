@@ -473,6 +473,35 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
       not, guest memory at the flip surface as BMP; at a hand-over the previous flip's draws and every 640-wide
       surface); `[D3D11] opaque depth read drawn/skipped` (log_batch once per programme).
 
+35. **Frame hitches: diagnostics on the title's threads, shader compiles (2026-10-24, runs `h1`-`h7`).**
+    Measured with two new probes: `RECOMP_D3D11_HITCH=<ms>` (a `[HITCH]` line per frame longer than that, with
+    the texture decode/upload and vertex-programme compile time the back end spent in it) and `RECOMP_SAMPLE=1`
+    (`src/sampler.c`: samples the game thread every 1 ms, unwinds 12 frames, splits samples into slow / normal
+    frames by the flip interval, `[SAMPLE]` tables every 60 s resolved through the PDB). Scripted driving:
+    `drive_ps.ps1 <tag> [secs] [dumpms] [steer] [gas]` -- but in races neither `rt` nor `a` moves the car
+    (menus take A fine), so these runs are mostly a standing car with traffic; the user's own driving is
+    the real test. Found, in order of size:
+    - **The executor's 10 s stats report** (`nv2a_pb_scan_report`: `[TEXUSE]`, `[GPU]` method counts) ran on
+      the thread feeding the GPU whenever RECOMP_PB_EXEC was set, i.e. always: 57 of 59 reports were followed
+      by a 150-750 ms frame. Now only with RECOMP_PB_REPORT_MS, RECOMP_NV2A_TRACE or RECOMP_PB_SCAN
+      (toolkit, `xbox_memory_layout.c`; `[PB] report took N ms`).
+    - **Blocking stderr.** In slow frames 50-65% of the game thread was in `WriteFile` under the CRT's
+      unbuffered stderr (`[READ]`, `[PATH]`, `[BRIDGE]`, `[KERNEL] summary` ... from the title's threads, plus
+      ~70k `[GPU] draw #N` lines a race from the executor, all under one stream lock). `main.c` now makes fd 2
+      the write end of an 8 MB pipe drained by a logger thread (`async_stderr`; a TLS callback copies what is
+      left at ExitProcess, the fault handler waits for the logger; `RECOMP_LOG_SYNC=1` = direct), and
+      `[GPU] draw #N` needs `RECOMP_GPU_DRAWLOG=1`. Same 7 min drive: frames > 45 ms 132 -> 9, and ~45%
+      more frames overall (flip 26157 -> 38085).
+    - **Vertex-programme compiles** (30-70 ms each; 200 ms when three new programmes stream in together) are
+      now done on a worker thread; until a shader is ready the executor runs that programme on the CPU
+      (`be_vsh_gpu` returns 0, it asks again every batch). Compiled shaders are cached on disk as
+      `shader_cache\vsh_<HLSL hash>.cso` (47 after one race; git-ignored), so later runs skip compiling.
+      `RECOMP_D3D11_VSH_SYNC=1` = compile on the spot. A first-run stream-in is now ~3 frames of ~50 ms.
+    Left: the race's own load (3.8 s, 57 textures + 31 MB decoded at once) and the results screen.
+    `run_mm3.bat` sets `RECOMP_D3D11_HITCH=60`, so a user's run.log shows any stall left while driving.
+    `[D3D11] dot stages` now logs each (programme, stage program) once instead of the first 12 draws, so the
+    water shader (`0064621`, xemu cache) shows up in run.log when it is first drawn.
+
 ## Open issues (2026-10-23, D3D11 back end)
 
 First pass done 2026-10-23 (runs `inv2`, `drv1`, `drv2`; driving script in that session's scratchpad: verify_ps.ps1
@@ -497,7 +526,7 @@ plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "
    Related: the full-screen pass `969115CF` (sp `006C621` = 2D, DOT_PRODUCT, DOT_PRODUCT, DOT_STR_3D; stage 0 = the
    depth buffer as 1280x480 L16, lookup 32x32 at `804E1000`) writes scene *alpha* = alpha * lookup(depth).a; before
    the dot modes existed it zeroed alpha. The 40x30 pass after it reads the scene: probably the glow/sky mask.
-2. **Water.** xemu's shader cache has MM3 pixel shaders with dependent stages: `0064621` (2D, DOT_PRODUCT x2,
+2. **Water -- verified (user, 2026-10-24: shows in Paris and Washington).** xemu's shader cache has MM3 pixel shaders with dependent stages: `0064621` (2D, DOT_PRODUCT x2,
    DOT_RFLCT_SPEC = texm3x3vspec, x6: the water/reflection shader), `006C621` (texm3x3tex), `000A621` (DOT_ST). The
    back end returned 0 for every mode >= 6. Now implemented (`fetch_all`/`dotmap` in d3d11_backend.c, toolkit passes
    SET_DOT_RGBMAPPING 0x1E74 and SET_SHADER_OTHER_STAGE_INPUT 0x1E78 in Nv2aBatchExt; DOT_STR_3D samples 2D at

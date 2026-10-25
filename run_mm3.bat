@@ -43,6 +43,9 @@ set RECOMP_DISPATCH_GATE=1
 rem The D3D11 back end opens its own window; this is only for the CPU rasteriser.
 rem set RECOMP_FB_WINDOW=1
 set RECOMP_KEYBOARD=1
+rem A [HITCH] line in run.log for every frame over 60 ms, with the texture /
+rem shader-compile time the back end spent in it (NOTES 35).
+set RECOMP_D3D11_HITCH=60
 rem Keyboard (arrows, Enter=Start, Z/X/C/V=A/B/X/Y, WASD=left stick, 1/3=triggers) and any XInput pad
 rem drive the game. A synthetic Start pulse (RECOMP_PAD_PRESS=0x10) would pause every race; leave it off.
 rem set RECOMP_PAD_PRESS=0x10

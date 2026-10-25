@@ -45,3 +45,6 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Compiled vertex programs (built from the game's microcode at run time)
+/shader_cache/

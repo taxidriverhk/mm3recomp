@@ -220,6 +220,8 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+static void log_wait_drained(void);
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -281,10 +283,100 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             }
         }
         fflush(stderr);
+        log_wait_drained();
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+/* ── Asynchronous stderr ──────────────────────────────────────
+ *
+ * stderr is unbuffered, and the runtime logs freely from every thread
+ * ([READ], [PATH], [KERNEL] summary, ...). Each line was a blocking WriteFile
+ * under the CRT's stream lock, on the game thread too: a sampling run put two
+ * thirds of the game thread's time in slow race frames there (NOTES 35). Now
+ * fd 2 is the write end of a large pipe and a logger thread copies it to the
+ * real stderr, so a log line costs the caller a memory copy. A TLS callback
+ * drains what is left when the process exits (ExitProcess skips atexit), and
+ * the fault handler waits for the logger before the process dies.
+ * RECOMP_LOG_SYNC=1 writes directly, as before. */
+#include <io.h>
+#include <fcntl.h>
+
+static HANDLE s_log_rd, s_log_out;
+
+static DWORD WINAPI log_thread(void *arg)
+{
+    static char buf[65536];
+    DWORD n, w;
+    (void)arg;
+    while (ReadFile(s_log_rd, buf, sizeof buf, &n, NULL) && n)
+        WriteFile(s_log_out, buf, n, &w, NULL);
+    return 0;
+}
+
+static void async_stderr(void)
+{
+    HANDLE rd, wr;
+    int fd;
+    const char *e = getenv("RECOMP_LOG_SYNC");
+
+    if (e && e[0] != '0')
+        return;
+    {
+        /* Our own handle to the real stderr: _dup2 below closes fd 2's. */
+        HANDLE cur = (HANDLE)_get_osfhandle(2);
+        if (cur == INVALID_HANDLE_VALUE || !cur
+            || !DuplicateHandle(GetCurrentProcess(), cur, GetCurrentProcess(), &s_log_out, 0, FALSE,
+                                DUPLICATE_SAME_ACCESS))
+            return;
+    }
+    if (!CreatePipe(&rd, &wr, NULL, 8u << 20)) {
+        CloseHandle(s_log_out);
+        return;
+    }
+    fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_TEXT);
+    if (fd < 0 || _dup2(fd, 2) != 0) {
+        CloseHandle(rd);
+        if (fd >= 0) _close(fd); else CloseHandle(wr);
+        return;
+    }
+    _close(fd);
+    s_log_rd = rd;
+    CreateThread(NULL, 0, log_thread, NULL, 0, NULL);
+}
+
+/* Fault path: let the logger thread write out what is queued (up to 1 s). */
+static void log_wait_drained(void)
+{
+    int i;
+    DWORD avail = 0;
+    if (!s_log_rd) return;
+    for (i = 0; i < 100; i++) {
+        if (!PeekNamedPipe(s_log_rd, NULL, 0, NULL, &avail, NULL) || !avail)
+            break;
+        Sleep(10);
+    }
+    Sleep(20);                  /* the last chunk read but not yet written */
+}
+
+/* ExitProcess: the other threads, the logger among them, are gone; copy the rest here. */
+static void NTAPI log_tls_callback(PVOID h, DWORD reason, PVOID r)
+{
+    static char buf[65536];
+    DWORD avail = 0, n, w;
+    (void)h; (void)r;
+    if (reason != DLL_PROCESS_DETACH || !s_log_rd)
+        return;
+    while (PeekNamedPipe(s_log_rd, NULL, 0, NULL, &avail, NULL) && avail
+           && ReadFile(s_log_rd, buf, avail < sizeof buf ? avail : sizeof buf, &n, NULL) && n)
+        WriteFile(s_log_out, buf, n, &w, NULL);
+}
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:mm3_log_tls_callback")
+#pragma const_seg(".CRT$XLB")
+const PIMAGE_TLS_CALLBACK mm3_log_tls_callback = log_tls_callback;
+#pragma const_seg()
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
@@ -302,6 +394,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    async_stderr();
 
     printf("=== Midtown Madness 3 - Static Recompilation ===\n");
     printf("Loading XBE...\n");
@@ -434,6 +527,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("\nStarting game...\n");
     fflush(stdout);
 
+    {
+        extern void mm3_sampler_start(void);
+        mm3_sampler_start();        /* RECOMP_SAMPLE=1 */
+    }
     xbe_entry_point();
 
     printf("\nGame returned. Cleaning up...\n");
