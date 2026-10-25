@@ -440,6 +440,7 @@ typedef struct {
     uint64_t color_draws;               /* batches that wrote colour here (0: only ever a depth address) */
     ID3D11Texture2D *snap_tex;          /* copy of the surface, for a draw that samples it */
     ID3D11ShaderResourceView *snap_srv;
+    uint32_t guest_sig;                 /* guest_hash of its memory when last synced (rt_take_cpu_writes) */
 } RT;
 
 typedef struct {
@@ -550,6 +551,43 @@ static void note(const char *what, HRESULT hr)
  * Default map: arrows = D-pad, Enter = Start, Backspace = Back, Z/X/C/V = A/B/X/Y,
  * Q/E = White/Black, 1/3 = triggers, W/A/S/D = left stick, I/J/K/L = right stick.
  * A real pad on port 0 keeps working and is merged with it. */
+static int stretch_mode(void);
+static void repaint_now(void);
+
+/* WM_SIZING: keep the client area 4:3 while the user drags an edge or corner, so
+ * the window never shows the picture stretched (DWM scales the last frame to the
+ * window until the next present). Maximised or snapped windows are letterboxed by
+ * picture_rect instead. */
+static void keep_aspect(HWND h, WPARAM edge, RECT *wr)
+{
+    RECT fr = { 0, 0, 0, 0 };
+    LONG cw, ch, fw, fh;
+
+    AdjustWindowRect(&fr, (DWORD)GetWindowLongA(h, GWL_STYLE), FALSE);
+    fw = fr.right - fr.left;
+    fh = fr.bottom - fr.top;
+    cw = (wr->right - wr->left) - fw;
+    ch = (wr->bottom - wr->top) - fh;
+    if (cw < 160) cw = 160;
+    if (edge == WMSZ_LEFT || edge == WMSZ_RIGHT) {
+        ch = cw * 3 / 4;                     /* width leads, height follows */
+    } else if (edge == WMSZ_TOP || edge == WMSZ_BOTTOM) {
+        cw = ch * 4 / 3;
+    } else if (cw * 3 > ch * 4) {            /* corner: the larger change leads */
+        ch = cw * 3 / 4;
+    } else {
+        cw = ch * 4 / 3;
+    }
+    if (edge == WMSZ_LEFT || edge == WMSZ_TOPLEFT || edge == WMSZ_BOTTOMLEFT)
+        wr->left = wr->right - (cw + fw);
+    else
+        wr->right = wr->left + cw + fw;
+    if (edge == WMSZ_TOP || edge == WMSZ_TOPLEFT || edge == WMSZ_TOPRIGHT)
+        wr->top = wr->bottom - (ch + fh);
+    else
+        wr->bottom = wr->top + ch + fh;
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -583,9 +621,19 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
         return 0;
+    case WM_SIZING:
+        if (!stretch_mode()) {
+            keep_aspect(h, w, (RECT *)l);
+            return TRUE;
+        }
+        break;
     case WM_SIZE:
-        if (w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l))
+        if (w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l)) {
             InterlockedExchange(&s_resized, 1);
+            /* Show the new size now: during a drag the modal size loop runs inside
+             * pump(), so no flip presents until the drag ends. */
+            repaint_now();
+        }
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -809,6 +857,8 @@ static int ensure_init(void)
 
 /* ---- render targets, depth buffers, textures --------------------------- */
 
+static uint32_t guest_hash(uint32_t va, uint32_t bytes);
+
 static RT *get_rt(const Nv2aSurface *s)
 {
     int i;
@@ -866,6 +916,7 @@ static RT *get_rt(const Nv2aSurface *s)
     r->va = s->color_va;
     r->w = cw;
     r->h = ch;
+    r->guest_sig = guest_hash(r->va, cw * ch * 4u);
     {
         float zero[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, r->rtv, zero);
@@ -952,6 +1003,45 @@ static uint32_t guest_hash(uint32_t va, uint32_t bytes)
         h = (h ^ p[i]) * 16777619u;
     h = (h ^ p[n - 1]) * 16777619u;
     return h;
+}
+
+/* A surface is memory, and the CPU can write it (D3D LockRect): MM3 decodes its
+ * loading-screen TGA straight into the back buffer, and Swap's blit copies that to
+ * the display buffer. Our surfaces live on the host and nothing here writes their
+ * guest memory, so a change there since the last look is the CPU's: take it into
+ * the host surface before the surface is sampled. RECOMP_D3D11_CPUWRITES=0: off. */
+static void rt_take_cpu_writes(RT *r, const Nv2aTexture *t)
+{
+    static int on = -1;
+    uint32_t sig, *argb, *up, x, y, tw, th, n;
+    D3D11_BOX box;
+
+    if (on < 0) { const char *e = getenv("RECOMP_D3D11_CPUWRITES"); on = !(e && e[0] == '0'); }
+    if (!on || !r->tex)
+        return;
+    sig = guest_hash(r->va, r->w * r->h * 4u);
+    if (sig == r->guest_sig)
+        return;
+    r->guest_sig = sig;
+    tw = t->width < r->w ? t->width : r->w;
+    th = t->height < r->h ? t->height : r->h;
+    argb = (uint32_t *)malloc((size_t)t->width * t->height * 4u);
+    up = (uint32_t *)malloc((size_t)tw * th * s_res * s_res * 4u);
+    if (argb && up && nv2a_backend_decode_texture(t, argb)) {
+        n = tw * s_res;
+        for (y = 0; y < th * s_res; y++)
+            for (x = 0; x < n; x++)
+                up[(size_t)y * n + x] = argb[(size_t)(y / s_res) * t->width + x / s_res];
+        box.left = box.top = box.front = 0;
+        box.right = n;
+        box.bottom = th * s_res;
+        box.back = 1;
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)r->tex, 0, &box, up, n * 4u, 0);
+        fprintf(stderr, "[D3D11] surface %08X written by the CPU: %ux%u of guest memory taken (flip %llu)\n",
+                r->va, tw, th, (unsigned long long)s_flip_count);
+    }
+    free(argb);
+    free(up);
 }
 
 /* A draw that samples the surface it draws to reads what is there before the
@@ -1072,8 +1162,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
         }
     }
     for (i = 0; i < s_rt_n; i++)
-        if (s_rt[i].va == t->offset && s_rt[i].srv && s_rt[i].color_draws)
+        if (s_rt[i].va == t->offset && s_rt[i].srv && s_rt[i].color_draws) {
+            rt_take_cpu_writes(&s_rt[i], t);
             return s_rt[i].srv;
+        }
     for (i = 0; i < s_zb_n; i++)
         if (s_zb[i].va == t->offset && s_zb[i].dsv) {
             ID3D11ShaderResourceView *dv = depth_view(&s_zb[i], t);
@@ -1082,8 +1174,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
         }
     /* A texture whose address is a surface the title rendered to. */
     for (i = 0; i < s_rt_n; i++)
-        if (s_rt[i].va == t->offset && s_rt[i].srv)
+        if (s_rt[i].va == t->offset && s_rt[i].srv) {
+            rt_take_cpu_writes(&s_rt[i], t);
             return s_rt[i].srv;
+        }
 
     {
         /* Hash only what the decode reads: level 0 in the texture's own format
@@ -3308,14 +3402,20 @@ static void resize_swap(void)
     fprintf(stderr, "[D3D11] window %ux%u\n", s_win_w, s_win_h);
 }
 
+/* RECOMP_D3D11_STRETCH=1: the picture fills the window, and the window resizes freely. */
+static int stretch_mode(void)
+{
+    static int stretch = -1;
+    if (stretch < 0) { const char *e = getenv("RECOMP_D3D11_STRETCH"); stretch = e && atoi(e) != 0; }
+    return stretch;
+}
+
 /* The window rectangle the 4:3 picture goes in: letterboxed or pillarboxed, or the
  * whole window with RECOMP_D3D11_STRETCH=1. */
 static void picture_rect(D3D11_VIEWPORT *vp)
 {
-    static int stretch = -1;
     float w = (float)s_win_w, h = (float)s_win_h;
-    if (stretch < 0) { const char *e = getenv("RECOMP_D3D11_STRETCH"); stretch = e && atoi(e) != 0; }
-    if (!stretch) {
+    if (!stretch_mode()) {
         if (w * 3.0f > h * 4.0f) w = floorf(h * 4.0f / 3.0f + 0.5f);
         else h = floorf(w * 3.0f / 4.0f + 0.5f);
     }
@@ -3442,6 +3542,18 @@ static void present_frame(RT *r)
     s_last_present_ms = GetTickCount64();
 }
 
+/* WM_SIZE: present the last frame again at the new window size (wndproc runs on the
+ * thread that owns the device: the window is pumped from the back end's entry points). */
+static void repaint_now(void)
+{
+    static int busy;
+    if (!s_swap || busy)
+        return;
+    busy = 1;
+    present_frame(s_shown_rt);
+    busy = 0;
+}
+
 /* The display framebuffer as guest memory holds it, as a texture. A title that
  * stops using the GPU -- MM3's loading screen, drawn by the CPU into the
  * framebuffer from a loader thread -- is only visible this way: the hardware
@@ -3497,6 +3609,8 @@ static RT *memory_frame(void)
                         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
                     }
                     ID3D11Texture2D_Release(st);
+                    /* Our own write, not the CPU's: rt_take_cpu_writes must not re-take it. */
+                    s_rt[i].guest_sig = guest_hash(s_rt[i].va, s_rt[i].w * s_rt[i].h * 4u);
                 }
                 fprintf(stderr, "[D3D11] display memory %08X takes over at flip %llu: %u black pixels filled from the surface\n",
                         va, (unsigned long long)s_flip_count, n);

@@ -524,6 +524,40 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     Not done: MSAA. The title samples its own colour surfaces (snapshots, glow, grade passes) and its depth
     (haze, distance mask), so MSAA would need a resolve before every such read and Texture2DMS depth reads,
     and PSW's SV_Depth output runs per pixel anyway; SSAA gets the same edges without touching that.
+37. **Loading-screen image; window keeps 4:3 (2026-10-24, runs `tp1`, `tp2`, `fix1`-`fix3`, `ld4`).**
+    - **What the loader does** (`sub_001E839C`, path from `sub_001E82DB`): mode 0 shows
+      `D:\Data\Shared\Menu\Gfx\Startup.tga`, otherwise a per-city/mode image from `Data_dvd.zip`
+      (`+LoadingScreens/English/<city>/<mode>/LoadingNN.TGA`, `Default_*.tga`; the `+` prefix is the zip,
+      so no file open shows in the log). `sub_001EC708` locks the back buffer (`80084000`, LIN_A8R8G8B8),
+      decodes the 24-bit TGA straight into it with the CPU, and calls `Swap`. Swap with copy flags
+      (`sub_00343A40`, bit 0) blits back buffer -> display buffer `801B0000` with D3D's own state
+      (`sub_00343110`: tables at `0x34FA50` render states, `0x34F9F8` stage states = COLOROP SELECTARG1,
+      COLORARG1 TEXTURE, ALPHAOP DISABLE): that is the `D3320CDA` full-screen draw. The loader thread
+      (`sub_001E7B8F`) then only animates the 128x64 meter from `LoadmeterTexture.raw` every 300 ms. The
+      same blit runs every frame in races (batch 0: last frame's scene into the display buffer).
+    - **Bug 1, recompiler: flags across a split chunk.** D3D SetTextureStageState (`sub_00341880`) does
+      `cmp edx, 0xC; jge 0x3418AF`, and 0x3418AF is a `jne` on the same flags. The disassembler made
+      0x3418AF its own function (D3D section unswept), whose flag variables start at 0, so the jne never
+      fired: every stage state >= 0xC (COLOROP..RESULTARG, TEXCOORDINDEX, ...) was stored as COLOROP.
+      The blit got COLOROP = DISABLE (from ALPHAOP), and the fixed-function combiner builder
+      (`0x34E420`; TEXTURE arg reads D3D's texture table at dev+0xB38, dev = `0x34FF00`) emitted stage 0
+      = diffuse x 1 (`04200000`, white) instead of texture x 1 (`08200000`, xemu's shader cache for
+      `D3320CDA`, all 12 entries). Fixed by a `patch_gen.py` patch (`edx != 0xC`). A scan of the generated
+      code finds 44 other functions whose first flag use has no producer in the function (e.g. `sub_0025DD4C`,
+      `sub_002BC817`, `sub_00335A29`, `sub_003560DE`); not looked at -- a lifter fix (carry the flags across
+      chunk transfers) would cover all of them.
+    - **Bug 2, back end: CPU writes to a surface.** A sampled texture whose address is a render target
+      came from the host surface, which never saw the CPU's TGA. `rt_take_cpu_writes` keeps a
+      `guest_hash` of each surface's guest memory (taken at creation; nothing in the back end writes it,
+      clears and draws included); a change when the surface is sampled means the CPU wrote it, and guest
+      memory is decoded into the host surface (n x upscaled). The memory merge re-baselines its own write.
+      Log: `surface ... written by the CPU`. `RECOMP_D3D11_CPUWRITES=0` = off.
+      Result: boot loading screen = Startup.tga + meter (`frames\fix3\f00001_f2.bmp`).
+    - **Window aspect:** item 36's letterbox only applied to frames presented after ResizeBuffers; the
+      legacy DISCARD swap chain is stretched by DWM to the window in between, and a drag-resize runs the
+      modal size loop inside `pump()`, so nothing presented until the drag ended. Now WM_SIZING keeps
+      the client area 4:3 (`keep_aspect`; maximised/snapped windows are letterboxed by `picture_rect`),
+      and WM_SIZE re-presents the last frame at once (`repaint_now`). `RECOMP_D3D11_STRETCH=1` = old.
 
 ## Open issues (2026-10-23, D3D11 back end)
 

@@ -16,6 +16,14 @@ PATCHES=[
  # recomp_manual.c and NOTES.md 33; RECOMP_PED_RIGID=1 restores the original.
  ("/* cmp LO8(eax), 4 (8-bit) */\n    if (CMP_AE(_fa, _fb)) goto loc_000DB6F6; /* jae: above or equal (unsigned >=) */\n",
   "/* cmp LO8(eax), 4 (8-bit) */\n    { extern int mm3_ped_rigid_lod(void);\n      if (CMP_AE(_fa, _fb) && mm3_ped_rigid_lod()) goto loc_000DB6F6; } /* mm3recomp patch: LOD 4+ draws skinned (see patch_gen.py) */\n"),
+ # D3D SetTextureStageState (sub_00341880): 'cmp edx, 0xC; jge 0x3418AF' lands on a jne
+ # that reuses those flags, but 0x3418AF is split off as its own function whose flag
+ # variables start at zero, so the jne never fired and every stage state >= 0xC was stored
+ # as COLOROP. Swap's back-to-front blit then ran with COLOROP = DISABLE (diffuse, white)
+ # instead of SELECTARG1(TEXTURE): the loading-screen image never reached the screen.
+ # edx is unchanged since the cmp. See NOTES.md 37.
+ ("loc_003418AF: ;\n    if (_flags /* jne: not equal / not zero */) { g_seh_ebp = ebp; sub_003418DC(); return; }\n",
+  "loc_003418AF: ;\n    if (edx != 0xC) { g_seh_ebp = ebp; sub_003418DC(); return; } /* mm3recomp patch: flags of the cmp in sub_00341880 (see patch_gen.py) */\n"),
 ]
 files=sorted(glob.glob(GEN+'recomp_*.c'))
 ok=True
