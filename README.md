@@ -14,7 +14,8 @@ submodule at v0.15.0 plus a patch of MM3-driven changes — see [Toolkit changes
 > **No game content is in this repository.** You need your own legally obtained copy of the game. The
 > generated C, the build output and every runtime dump are derived from the game and are git-ignored.
 
-**Status: roughly 70 % done — boots, plays the intro movies, menus, and full races with audio and a gamepad.**
+**Status: roughly 80 % done — boots, plays the intro movies, loading screens, menus, and full races with audio,
+a gamepad (with rumble), up to 6× internal resolution and a resizable 4:3 window.**
 See [Status](#status) for what works and what doesn't.
 
 ---
@@ -126,6 +127,8 @@ run_mm3.bat
 The batch file sets the environment variables the port needs (below), starts the exe from the repository root
 and writes the log to `run.log`. A window opens; its title shows FPS and draw count.
 Expect about two minutes of intro movies (press Start/Enter to skip ahead), then the title screen.
+The first race compiles its vertex shaders in the background; they are cached in `shader_cache\`
+(git-ignored), so later runs start faster.
 
 The required settings, all in `run_mm3.bat`:
 
@@ -148,6 +151,8 @@ Useful optional knobs:
 | `RECOMP_D3D11_SCALE=<f>` | Initial window size, f × 640×480 (default 1.5). The window can be resized or maximised; the picture keeps 4:3 |
 | `RECOMP_D3D11_STRETCH=1` | Fill the window instead of keeping 4:3 |
 | `RECOMP_D3D11_VSYNC=0` | No vsync |
+| `RECOMP_D3D11_HITCH=<ms>` | Log a `[HITCH]` line for every frame slower than this (`run_mm3.bat` sets 60) |
+| `RECOMP_RUMBLE=0` | Don't forward rumble to the controller |
 
 ## Controls
 
@@ -165,7 +170,8 @@ The keyboard works at the same time:
 | Start | Enter |
 | Back | Backspace |
 
-Rumble is not forwarded to the host controller yet.
+Rumble: the game's `XInputSetState` calls are forwarded to the first controller (left = low-frequency motor,
+right = high-frequency). `RECOMP_RUMBLE=0` turns it off.
 
 ---
 
@@ -221,7 +227,8 @@ At run time the recompiled code thinks it is on an Xbox. The toolkit provides:
 - **`src/recomp_manual.c`** — hand-written replacements for individual guest functions, where the original depends
   on real hardware behaviour. Examples: the D3D GPU fence wait (made honest against the executor's semaphore),
   the video-overlay stop used by Bink movies, XNet (forced "no network"), and the XAPI gamepad calls
-  (`XGetDevices`, `XInputOpen`, `XInputGetState`, …) which are answered directly instead of emulating USB.
+  (`XGetDevices`, `XInputOpen`, `XInputGetState`, `XInputSetState` for rumble, …) which are answered directly
+  instead of emulating USB.
 - **`src/d3d11_backend.c`** — the GPU renderer:
   - NV2A **vertex programs are translated to HLSL** and run on the GPU (this took the frame rate from ~8 to ~40–50 fps);
   - the **register combiners** (8 general stages + final combiner) are a single data-driven HLSL pixel shader, so
@@ -229,6 +236,13 @@ At run time the recompiled code thinks it is on an Xbox. The toolkit provides:
   - render targets are D3D11 textures keyed by guest address, so render-to-texture and the game's post chain
     (colour grade, glare, depth-based haze) work; depth buffers can be read back as textures the way the game does;
   - textures (swizzled, DXT, palettised…) are decoded on first use and re-decoded when their guest bytes change;
+  - MM3 **w-buffers** its scene (linear depth); the back end writes w as depth for those draws, which the
+    distance-haze pass needs;
+  - CPU writes into a render target (the loading-screen TGA is decoded straight into the back buffer) are
+    picked up from guest memory;
+  - everything renders at an **internal resolution** of n × 640×480 and is averaged down at present
+    (supersampling), with optional FXAA, letterboxed 4:3 in a resizable window;
+  - vertex shaders compile on a worker thread (the CPU interpreter covers the gap) and are cached on disk;
   - Bink movies drawn through the NV2A video overlay are composited at present time.
 
 `NOTES.md` is the detailed engineering log: every bug found, why, and how it was fixed — read it before
@@ -241,9 +255,11 @@ live in `patches/xboxrecomp.patch` (9 files) and are applied on top by `apply_pa
 submodule is set to `ignore = dirty`, so the patched files don't show up as changes in this repo.
 After changing toolkit files, regenerate the patch with
 `git -C xboxrecomp diff > patches/xboxrecomp.patch`. The patch mainly covers:
-`nv2a_backend.h` / `nv2a_pb_exec.c` (`draw_ext`: full combiner, four texture stages, fog, clip state and
-extra vertex outputs handed to back ends), the pushbuffer ring-wrap fix in `nv2a_pb_scan.c`, the
-inline-array vertex sizing fix, and vertex-program interpreter defaults/`ARL` rounding in `nv2a_vsh_interp.c`.
+`nv2a_backend.h` / `nv2a_pb_exec.c` (`draw_ext`: full combiner, four texture stages, fog, clip state,
+`SET_CONTROL0` for the w-buffer and extra vertex outputs handed to back ends), the pushbuffer ring-wrap fix in
+`nv2a_pb_scan.c`, the inline-array vertex sizing fix, vertex-program interpreter defaults/`ARL` rounding in
+`nv2a_vsh_interp.c`, the executor's stats report made opt-in (`xbox_memory_layout.c`; it stalled the GPU
+thread), and APU / USB-gamepad fixes.
 
 ---
 
@@ -251,24 +267,25 @@ inline-array vertex sizing fix, and vertex-program interpreter defaults/`ARL` ro
 
 **Works**
 
-- Boot, the three intro movies (with sound), title screen, profile, menus, car select, loading screen meter
-- Full races in **Paris** and **Washington** with correct colours, HUD, minimap, pedestrians and traffic,
-  ~40–50 fps on the GPU
+- Boot, the three intro movies (with sound), title screen, profile, menus, car select
+- Loading screens with their artwork (`Startup.tga` at boot, per-city images before races) and the meter
+- Full races in **Paris** and **Washington** with correct colours, HUD, minimap, pedestrians, traffic, water
+  and the distance haze, ~40–50 fps on the GPU at 2× internal resolution
 - Audio: music, effects and movie sound via the emulated APU → XAudio2
-- Gamepad and keyboard input
+- Gamepad and keyboard input; rumble forwarded to the controller
+- Supersampling (`RECOMP_D3D11_RES`), optional FXAA, resizable window that keeps 4:3
 - 10+ minute sessions without a crash
 
 **Open issues**
 
-1. **Frame-rate drops while streaming the city** — hitches when buildings/objects are loaded and unloaded as
-   the player drives around.
-2. **City backdrop shows through geometry** in both Paris and Washington (far scenery reads as a washed-out
-   backdrop image; likely in the depth-based post passes, see `NOTES.md` "Open issues" 1 and 3b).
-3. **Loading-screen image missing** — only the progress bar is drawn.
-4. Occasional dark / orange wedge frames when the camera is pushed into a wall.
-5. Water rendering unverified (dependent-texture modes are implemented but not checked on the river).
-6. No controller rumble; the window stretches instead of keeping the game's aspect ratio.
-7. Xbox Live / System Link: XNet is stubbed out, no networking.
+1. **Short hitches when a race loads** (~3.8 s, textures decoded at once) and on the results screen; the
+   first stream-in of new shaders costs a few ~50 ms frames on the first run (cached afterwards).
+2. The colour-grade pass is missing in about 1 frame in 300.
+3. 44 recompiled functions read CPU flags set by their caller (split chunks); one of them broke the loading
+   screen and was patched, the rest are unchecked (`NOTES.md` 37). A lifter fix would cover them all.
+4. Rumble is forwarded but not yet confirmed by feel in a race.
+5. No MSAA (deliberately; supersampling instead, see `NOTES.md` 36).
+6. Xbox Live / System Link: XNet is stubbed out, no networking.
 
 ## Repository layout
 
@@ -279,14 +296,16 @@ inline-array vertex sizing fix, and vertex-program interpreter defaults/`ARL` ro
 | `src/recomp_manual.c` | Hand-written guest-function overrides |
 | `src/d3d11_backend.c` | Direct3D 11 renderer for the NV2A executor |
 | `src/dstrace.inc` | Generated DirectSound/XACT call-trace wrappers (`RECOMP_DSTRACE=1`) |
+| `src/sampler.c` | Game-thread sampling profiler (`RECOMP_SAMPLE=1`) |
 | `config/seed_functions.json` | Disassembler seeds |
 | `regen.ps1`, `regen_once.ps1` | Full pipeline + build |
 | `patches/xboxrecomp.patch`, `apply_patches.ps1` | This port's changes to the toolkit, and the script that applies them |
 | `patch_gen.py` | Post-generation patches |
 | `reseed.py`, `loop3.ps1` | Seed discovery from runtime logs |
 | `run_mm3.bat` | Run with the required settings |
-| `verify_ps.ps1`, `runtest.ps1`, `runlive.ps1` | Scripted test runs (frame dumps, scripted input) |
+| `verify_ps.ps1`, `runtest.ps1`, `runlive.ps1`, `drive_ps.ps1` | Scripted test runs (frame dumps, scripted input) |
 | `src/recomp/gen/` | *(ignored)* generated C |
+| `shader_cache/` | *(ignored)* compiled vertex shaders, built at run time |
 | `xboxrecomp/` | The recompilation toolkit (MIT), git submodule |
 | `NOTES.md` | Engineering log |
 | `game_files/` | *(ignored)* your extracted disc |
@@ -303,6 +322,11 @@ A few starting points (many more in `NOTES.md` → "Debug recipes"):
 - The exe has a PDB, so the crash handler and cdb/WinDbg map a host RIP back to `sub_XXXXXXXX`, i.e. the guest
   function. Exit codes: `-1073741819` access violation, `-1073741676` divide by zero, `-1073741571` stack overflow.
 - `verify_ps.ps1 <tag>` runs a scripted race and dumps frames to `frames\<tag>` (the race starts ~4 min in).
+  Scripted pad input works in menus but does not drive the car in a race.
+- `RECOMP_D3D11_HITCH=<ms>` and `RECOMP_SAMPLE=1` find frame stalls; `RECOMP_PAD_TRACE=1` logs the XAPI pad
+  calls (including rumble speeds).
+- stderr goes through a pipe drained by a logger thread so logging never blocks the game; `RECOMP_LOG_SYNC=1`
+  writes directly.
 
 ## Legal
 

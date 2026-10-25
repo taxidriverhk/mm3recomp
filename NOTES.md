@@ -638,12 +638,13 @@ plus `rt` / `rt+lleft` lines appended to RECOMP_PAD_LIVE). Runs need `subst M: "
    Near/far: MM3 sends SET_ZMIN_MAX_CONTROL = 0x00000001 (CULL) on every draw (now in `Nv2aRenderState
    .zmin_max_control`); always-clip vs always-clamp A/B runs were inconclusive, so the default stays clamp
    (`RECOMP_D3D11_DEPTHCLIP=1` clip, `=2` follow the register).
-4. **Gamepad rumble.** The pad should vibrate on impacts etc. The game drives rumble through `XInputSetState`; route
-   that to the host controller (XInput on Windows) instead of dropping it.
-5. **Window aspect ratio.** The window/back buffer should keep the game's own aspect ratio (letterbox/pillarbox
-   on resize) instead of stretching to the window size.
-6. **Anti-aliasing.** Add host-side AA to the D3D11 back end (e.g. MSAA render targets resolved before present,
-   with an env/config switch for the sample count).
+4. **Gamepad rumble -- done (2026-10-24), not yet felt in a race.** `sub_00361E7B` (XInputSetState override)
+   reads XINPUT_RUMBLE at feedback+0x42 (left) / +0x44 (right) -- the XDK header is packed, 66 bytes; filled by
+   `sub_001A60A6` from its motor floats at esi+0x88 / +0x8C -- and calls the toolkit's `xbox_InputSetState(0)`
+   when the speeds change (the game calls it in a tight loop, ~350k calls in 150 s). Motors zeroed at exit;
+   `RECOMP_RUMBLE=0` = off; `RECOMP_PAD_TRACE=1` logs the speeds.
+5. **Window aspect ratio -- done** (items 36, 37).
+6. **Anti-aliasing -- done** as supersampling + optional FXAA (item 36); MSAA deliberately skipped.
 
 ## Next steps
 
