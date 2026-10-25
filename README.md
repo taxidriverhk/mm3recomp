@@ -139,7 +139,15 @@ The required settings, all in `run_mm3.bat`:
 | `RECOMP_KEYBOARD=1` | Keyboard → virtual pad (a real pad is merged in either way) |
 | `RECOMP_WATCHDOG_SECS=900` | Print a state dump if the game stops making progress |
 
-Useful optional knobs: `RECOMP_D3D11_SCALE=<n>` (internal resolution scale), `RECOMP_D3D11_VSYNC=0`.
+Useful optional knobs:
+
+| Variable | Effect |
+|---|---|
+| `RECOMP_D3D11_RES=<n>` | Internal resolution: n × 640×480 (default 2 = 1280×960, max 6). Above the window size it is averaged down, which is supersampling anti-aliasing; 1 = the console's own resolution |
+| `RECOMP_D3D11_FXAA=1` | FXAA pass over the final picture (cheap; softens HUD text slightly) |
+| `RECOMP_D3D11_SCALE=<f>` | Initial window size, f × 640×480 (default 1.5). The window can be resized or maximised; the picture keeps 4:3 |
+| `RECOMP_D3D11_STRETCH=1` | Fill the window instead of keeping 4:3 |
+| `RECOMP_D3D11_VSYNC=0` | No vsync |
 
 ## Controls
 

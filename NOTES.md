@@ -501,6 +501,29 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     `run_mm3.bat` sets `RECOMP_D3D11_HITCH=60`, so a user's run.log shows any stall left while driving.
     `[D3D11] dot stages` now logs each (programme, stage program) once instead of the first 12 draws, so the
     water shader (`0064621`, xemu cache) shows up in run.log when it is first drawn.
+36. **Internal resolution, supersampling AA, FXAA, resizable 4:3 window (2026-10-24).**
+    `RECOMP_D3D11_RES=<n>` (default 2, max 6): every guest surface and depth buffer is created at n times its
+    guest size. RT/ZB `w`/`h` stay guest pixels -- the title's coordinates, texture-coordinate scaling
+    (`stage_scale`), the grown-surface logic and the `>= 640` checks are unchanged -- only the D3D11 textures,
+    `set_viewport`, the partial-clear rectangle and the snapshot copy are scaled. Positions reach the GPU in
+    guest pixels and become NDC through `inv_half`, so the bigger viewport is all the rasteriser needs; no
+    shader reads `SV_Position.xy` except DPS. Depth read as a texture (`depth_view`): plain depth is made at the
+    internal size; the packed "wide" Z24S8-as-L16 shape stays at guest size (DPS loads every `dscale`-th depth
+    pixel), so filtering never mixes its two half-words. MM3 does read it wide (haze / distance mask): at 2x the
+    first run (`res2`) showed a dither of bright even columns in diagonal bands following depth -- the internal
+    sub-pixels sit +-0.25 guest pixel = +-0.5 texel off centre and alternated between the lo and hi halves. A
+    stage that reads a wide view gets `stage_scale[st].z = n`, and ps_main moves its coordinates to the guest
+    pixel centre with ddx/ddy (`res2b`: gone; those passes are effectively guest-resolution). CPU readbacks: the loading-screen memory merge takes
+    every n-th host pixel; `_DUMP`/`write_rt_bmp` write the texture's real size (frame dumps are now 1280x960);
+    the STEPSIG grid scales.
+    Present (`present_frame`): the 4:3 picture is letterboxed in the window (`RECOMP_D3D11_STRETCH=1` fills);
+    WM_SIZE sets a flag and the next present calls `ResizeBuffers`, so maximising shows the internal resolution
+    instead of stretching 960x720. OPS's `scan()` shrinks with ceil(ratio)^2 bilinear taps over each output
+    pixel's footprint (at 2x exactly a 2x2 box), i.e. SSAA whenever internal > window. `RECOMP_D3D11_FXAA=1`
+    renders the scanout into a picture-sized texture and runs FXAA (console variant) into the back buffer.
+    Not done: MSAA. The title samples its own colour surfaces (snapshots, glow, grade passes) and its depth
+    (haze, distance mask), so MSAA would need a resolve before every such read and Texture2DMS depth reads,
+    and PSW's SV_Depth output runs per pixel anyway; SSAA gets the same edges without touching that.
 
 ## Open issues (2026-10-23, D3D11 back end)
 

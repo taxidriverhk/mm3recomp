@@ -19,7 +19,9 @@
  * bump/dot-product stage modes (read as zero, as in the executor).
  *
  * Enabled by RECOMP_D3D11=1 (main.c). Environment knobs:
- *   RECOMP_D3D11_SCALE=<n.n>   window scale over 640x480 (default 1.5)
+ *   RECOMP_D3D11_SCALE=<n.n>   initial window scale over 640x480 (default 1.5)
+ *   RECOMP_D3D11_RES=<n>       internal resolution n x guest size (default 2; SSAA above the window)
+ *   RECOMP_D3D11_FXAA=1        FXAA at present;  RECOMP_D3D11_STRETCH=1  fill the window (no 4:3)
  *   RECOMP_D3D11_VSYNC=0       present without waiting for vblank
  *   RECOMP_D3D11_NOCULL=1      ignore the title's cull state
  *   RECOMP_D3D11_CULLFLIP=1    swap the front-face winding
@@ -268,6 +270,18 @@ static const char s_hlsl[] =
 "}\n"
 "float4 ps_main(VSOut i) {\n"
 "  float4 c;\n"
+/* stage_scale[st].z = n: the stage reads a guest-sized packed depth view (depth_view,
+ * wide) while drawing at n x the guest size. Its coordinates are moved to the guest
+ * pixel's centre, so each sub-pixel reads the texel pair the console's pixel would. */
+"  {\n"
+"    float4 tcs[4] = { i.t0, i.t1, i.t2, i.t3 };\n"
+"    [unroll] for (uint st = 0u; st < 4u; st++) {\n"
+"      float n = stage_scale[st].z;\n"
+"      float2 off = n > 1.0 ? (floor(i.pos.xy / n) + 0.5) * n - i.pos.xy : float2(0, 0);\n"
+"      tcs[st] += ddx(tcs[st]) * off.x + ddy(tcs[st]) * off.y;\n"
+"    }\n"
+"    i.t0 = tcs[0]; i.t1 = tcs[1]; i.t2 = tcs[2]; i.t3 = tcs[3];\n"
+"  }\n"
 "  float zv = zclip.w != 0.0 ? i.pos.w * zscale : i.pos.z;\n"
 "  if (zclip.z != 0.0 && (zv < zclip.x || zv > zclip.y)) discard;\n"
 "  if (dbg.x != 0u) {\n"
@@ -330,10 +344,24 @@ static const char s_hlsl[] =
  * only where the frame shows the key colour, the video replaces the frame.
  * orect: x, y, w, h; oin: in_s, in_t, scale_x, scale_y; osz: display w, h,
  * video w, h; okey: key rgb, keying on. */
-"cbuffer OCB : register(b2) { float4 orect; float4 oin; float4 osz; float4 okey; uint4 oon; };\n"
+"cbuffer OCB : register(b2) { float4 orect; float4 oin; float4 osz; float4 okey; uint4 oon; float4 osrc; };\n"
 "Texture2D vtex : register(t1);\n"
+/* The frame at the output size. osrc: source texel size (x, y), source texels per
+ * output pixel (z, w). Shrinking, ceil(ratio)^2 bilinear taps spread evenly over the
+ * pixel's footprint average it down -- at 2x exactly a 2x2 box (supersampling). */
+"float3 scan(float2 uv) {\n"
+"  if (osrc.z <= 1.0 && osrc.w <= 1.0) return tex0.SampleLevel(smp0, uv, 0).rgb;\n"
+"  int nx = (int)ceil(osrc.z), ny = (int)ceil(osrc.w);\n"
+"  float2 st = osrc.xy * osrc.zw / float2(nx, ny);\n"
+"  float2 o = uv - st * (float2(nx, ny) - 1.0) * 0.5;\n"
+"  float3 a = 0;\n"
+"  for (int y = 0; y < ny; y++)\n"
+"    for (int x = 0; x < nx; x++)\n"
+"      a += tex0.SampleLevel(smp0, o + st * float2(x, y), 0).rgb;\n"
+"  return a / (float)(nx * ny);\n"
+"}\n"
 "float4 OPS(BOut i) : SV_Target {\n"
-"  float4 c = float4(tex0.Sample(smp0, i.uv).rgb, 1);\n"
+"  float4 c = float4(scan(i.uv), 1);\n"
 "  if (oon.y == 0u) c = float4(0, 0, 0, 1);\n"
 "  if (oon.x == 0u) return c;\n"
 "  float2 d = i.uv * osz.xy - orect.xy;\n"
@@ -341,15 +369,33 @@ static const char s_hlsl[] =
 "  if (okey.w > 0.5 && any(abs(c.rgb - okey.rgb) > 0.5 / 255.0)) return c;\n"
 "  return float4(vtex.Sample(smp0, (oin.xy + d * oin.zw) / osz.zw).rgb, 1);\n"
 "}\n"
+/* FXAA (Lottes' console variant) over the finished scanout; osrc.xy = its texel size. */
+"float fxl(float2 uv) { return dot(tex0.SampleLevel(smp0, uv, 0).rgb, float3(0.299, 0.587, 0.114)); }\n"
+"float4 FXPS(BOut i) : SV_Target {\n"
+"  float2 rc = osrc.xy, uv = i.uv;\n"
+"  float3 cm = tex0.SampleLevel(smp0, uv, 0).rgb;\n"
+"  float lm = dot(cm, float3(0.299, 0.587, 0.114));\n"
+"  float nw = fxl(uv + float2(-0.5, -0.5) * rc), ne = fxl(uv + float2(0.5, -0.5) * rc);\n"
+"  float sw = fxl(uv + float2(-0.5, 0.5) * rc), se = fxl(uv + float2(0.5, 0.5) * rc);\n"
+"  float lo = min(lm, min(min(nw, ne), min(sw, se))), hi = max(lm, max(max(nw, ne), max(sw, se)));\n"
+"  if (hi - lo < max(0.0312, hi * 0.125)) return float4(cm, 1);\n"
+"  float2 dir = float2((sw + se) - (nw + ne), (nw + sw) - (ne + se));\n"
+"  float red = max((nw + ne + sw + se) * (0.25 * 0.125), 1.0 / 128.0);\n"
+"  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + red), -8.0, 8.0) * rc;\n"
+"  float3 a = 0.5 * (tex0.SampleLevel(smp0, uv - dir / 6.0, 0).rgb + tex0.SampleLevel(smp0, uv + dir / 6.0, 0).rgb);\n"
+"  float3 b = a * 0.5 + 0.25 * (tex0.SampleLevel(smp0, uv - dir * 0.5, 0).rgb + tex0.SampleLevel(smp0, uv + dir * 0.5, 0).rgb);\n"
+"  float lb = dot(b, float3(0.299, 0.587, 0.114));\n"
+"  return float4((lb < lo || lb > hi) ? a : b, 1);\n"
+"}\n"
 /* Depth buffer read back as a texture. A title that samples its Z24S8 buffer as
  * a 16-bit luminance texture twice as wide as the buffer gets two texels per
  * depth pixel: the low half-word (z low byte, stencil) and the high one (the
  * top 16 bits of z). Narrow: plain depth in all three channels. */
 "Texture2D<float> dtex : register(t4);\n"
-"cbuffer DCB : register(b1) { uint wide; uint3 dpad; };\n"
+"cbuffer DCB : register(b1) { uint wide; uint dscale; uint2 dpad; };\n"
 "float4 DPS(BOut i) : SV_Target {\n"
 "  uint2 p = (uint2)i.pos.xy;\n"
-"  uint2 q = wide ? uint2(p.x >> 1, p.y) : p;\n"
+"  uint2 q = wide ? uint2(p.x >> 1, p.y) * dscale : p;\n"
 "  float z = dtex.Load(int3(q, 0));\n"
 "  uint z24 = (uint)(z * 16777215.0 + 0.5);\n"
 "  float v = z;\n"
@@ -442,6 +488,18 @@ static uint32_t s_vb_off;
 static ID3D11SamplerState *s_samp_linear_clamp;
 static ID3D11ShaderResourceView *s_white_srv;
 static uint32_t s_win_w, s_win_h;
+static volatile LONG s_resized;       /* WM_SIZE seen: the swap chain follows at the next present */
+/* Internal resolution: every guest surface and depth buffer is s_res times its guest
+ * size in each axis (RECOMP_D3D11_RES, default 2). RT/ZB w and h stay guest pixels --
+ * the title's coordinates -- and only the textures, viewports and clear rectangles are
+ * scaled. Above the window size the present filter averages it down (supersampling). */
+static uint32_t s_res = 1;
+static int s_fxaa;                    /* RECOMP_D3D11_FXAA=1: FXAA pass at present */
+static ID3D11PixelShader *s_fxps;
+static ID3D11Texture2D *s_post_tex;   /* the scanout before FXAA, window-sized */
+static ID3D11RenderTargetView *s_post_rtv;
+static ID3D11ShaderResourceView *s_post_srv;
+static uint32_t s_post_w, s_post_h;
 static int s_failed;
 static int s_vsync = 1, s_nocull, s_cullflip, s_nodepth, s_trace;
 
@@ -524,6 +582,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
+        return 0;
+    case WM_SIZE:
+        if (w != SIZE_MINIMIZED && LOWORD(l) && HIWORD(l))
+            InterlockedExchange(&s_resized, 1);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -611,6 +673,10 @@ static int init_device(void)
     s_cullflip = getenv("RECOMP_D3D11_CULLFLIP") != NULL;
     s_nodepth  = getenv("RECOMP_D3D11_NODEPTH") != NULL;
     s_trace    = getenv("RECOMP_D3D11_TRACE") != NULL;
+    s_res = (e = getenv("RECOMP_D3D11_RES")) ? (uint32_t)atoi(e) : 2;
+    if (s_res < 1) s_res = 1;
+    if (s_res > 6) s_res = 6;
+    s_fxaa = (e = getenv("RECOMP_D3D11_FXAA")) && atoi(e) != 0;
 
     if (!create_window())
         return 0;
@@ -670,10 +736,18 @@ static int init_device(void)
             return 0;
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(opsb), ID3D10Blob_GetBufferSize(opsb), NULL, &s_ops);
         memset(&obd, 0, sizeof obd);
-        obd.ByteWidth = 80;
+        obd.ByteWidth = 96;
         obd.Usage = D3D11_USAGE_DEFAULT;
         obd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         ID3D11Device_CreateBuffer(s_dev, &obd, NULL, &s_ocb);
+    }
+    if (s_fxaa) {
+        ID3DBlob *fxb = compile("FXPS", "ps_5_0");
+        if (fxb) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(fxb), ID3D10Blob_GetBufferSize(fxb), NULL, &s_fxps);
+            ID3D10Blob_Release(fxb);
+        }
+        if (!s_fxps) s_fxaa = 0;
     }
     hr = ID3D11Device_CreateInputLayout(s_dev, il, 8, ID3D10Blob_GetBufferPointer(vsb),
                                         ID3D10Blob_GetBufferSize(vsb), &s_layout);
@@ -714,7 +788,8 @@ static int init_device(void)
     ID3D11Device_CreateSamplerState(s_dev, &smd, &s_samp_linear_clamp);
 
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
-    fprintf(stderr, "[D3D11] device ready (feature level 0x%X), window %ux%u\n", fl, s_win_w, s_win_h);
+    fprintf(stderr, "[D3D11] device ready (feature level 0x%X), window %ux%u, internal %ux (%ux%u)%s\n", fl,
+            s_win_w, s_win_h, s_res, 640 * s_res, 480 * s_res, s_fxaa ? ", FXAA" : "");
     fflush(stderr);
     return 1;
 }
@@ -777,8 +852,8 @@ static RT *get_rt(const Nv2aSurface *s)
     if (r->tex) ID3D11Texture2D_Release(r->tex);
     memset(r, 0, sizeof *r);
     memset(&td, 0, sizeof td);
-    td.Width = cw;
-    td.Height = ch;
+    td.Width = cw * s_res;
+    td.Height = ch * s_res;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
@@ -831,8 +906,8 @@ static ZB *get_zb(uint32_t va, uint32_t w, uint32_t h)
     if (z->tex) ID3D11Texture2D_Release(z->tex);
     memset(z, 0, sizeof *z);
     memset(&td, 0, sizeof td);
-    td.Width = w;
-    td.Height = h;
+    td.Width = w * s_res;
+    td.Height = h * s_res;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_R24G8_TYPELESS;
     td.SampleDesc.Count = 1;
@@ -887,8 +962,8 @@ static ID3D11ShaderResourceView *rt_snapshot(RT *r)
     if (!r->snap_tex) {
         D3D11_TEXTURE2D_DESC td;
         memset(&td, 0, sizeof td);
-        td.Width = r->w;
-        td.Height = r->h;
+        td.Width = r->w * s_res;
+        td.Height = r->h * s_res;
         td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -907,7 +982,9 @@ static ID3D11ShaderResourceView *rt_snapshot(RT *r)
 static ID3D11ShaderResourceView *depth_view(ZB *z, const Nv2aTexture *t)
 {
     uint32_t wide = (t->width >= 2 * z->w) ? 1u : 0u;
-    uint32_t w = t->width, h = t->height;
+    /* Plain depth is read at the internal resolution; the packed two-texels-per-pixel
+     * shape stays at guest size, so a filtered read never mixes the halves. */
+    uint32_t sc = wide ? 1u : s_res, w = t->width * sc, h = t->height * sc;
 
     if (!z->depth_srv || !s_dps || !w || !h)
         return NULL;
@@ -937,7 +1014,7 @@ static ID3D11ShaderResourceView *depth_view(ZB *z, const Nv2aTexture *t)
         ID3D11ShaderResourceView *none[1] = { NULL };
         uint32_t cbv[4];
 
-        cbv[0] = wide; cbv[1] = cbv[2] = cbv[3] = 0;
+        cbv[0] = wide; cbv[1] = wide ? s_res : 1u; cbv[2] = cbv[3] = 0;
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_dcb, 0, NULL, cbv, 0, 0);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &z->view_rtv, NULL);
         vp.TopLeftX = vp.TopLeftY = 0;
@@ -1396,8 +1473,8 @@ static void set_viewport(uint32_t w, uint32_t h)
 {
     D3D11_VIEWPORT vp;
     vp.TopLeftX = vp.TopLeftY = 0;
-    vp.Width = (float)w;
-    vp.Height = (float)h;
+    vp.Width = (float)(w * s_res);
+    vp.Height = (float)(h * s_res);
     vp.MinDepth = 0;
     vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
@@ -1448,7 +1525,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
                 if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1, (void **)&ctx1)))
                     ctx1 = NULL;
             }
-            rc.left = 0; rc.top = 0; rc.right = (LONG)s->width; rc.bottom = (LONG)s->height;
+            rc.left = 0; rc.top = 0; rc.right = (LONG)(s->width * s_res); rc.bottom = (LONG)(s->height * s_res);
             if (ctx1)
                 ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)r->rtv, c, &rc, 1);
             else
@@ -2530,6 +2607,9 @@ vertices_ready:
                     tw = s_rt[k].w; th = s_rt[k].h;
                     break;
                 }
+            for (k = 0; k < s_zb_n && s_res > 1; k++)
+                if (s_zb[k].view_wide && s_zb[k].view_srv && s_zb[k].view_srv == srvs[st])
+                    cb.stage_scale[st][2] = (float)s_res;
             cb.stage_valid[st] = 1;
             if (!si->normalised) {
                 cb.stage_scale[st][0] = 1.0f / (float)tw;
@@ -2822,8 +2902,8 @@ grade_drawn:;
                                         uint32_t sum = 0;
                                         for (py = 0; py < 40; py += 8)
                                             for (px = 0; px < 40; px += 8) {
-                                                const uint8_t *q = (const uint8_t *)sm.pData + (size_t)(gy * 40 + py) * sm.RowPitch
-                                                                   + (size_t)(gx * 40 + px) * 4;
+                                                const uint8_t *q = (const uint8_t *)sm.pData + (size_t)((gy * 40 + py) * s_res) * sm.RowPitch
+                                                                   + (size_t)((gx * 40 + px) * s_res) * 4;
                                                 sum += q[0] + q[1] + q[2];
                                             }
                                         fprintf(stderr, "%02X", sum / 75u > 255u ? 255u : sum / 75u);
@@ -2984,18 +3064,18 @@ static void dump_rt(const RT *r, int force)
         snprintf(path, sizeof path, "%s%05u_f%llu.bmp", prefix, n++, (unsigned long long)s_flip_count);
         f = fopen(path, "wb");
         if (f) {
-            uint32_t rowb = (r->w * 3 + 3) & ~3u, size = 54 + rowb * r->h;
+            uint32_t rowb = (td.Width * 3 + 3) & ~3u, size = 54 + rowb * td.Height;
             uint8_t hdr[54] = { 'B', 'M' };
             hdr[2] = (uint8_t)size; hdr[3] = (uint8_t)(size >> 8); hdr[4] = (uint8_t)(size >> 16); hdr[5] = (uint8_t)(size >> 24);
             hdr[10] = 54; hdr[14] = 40;
-            hdr[18] = (uint8_t)r->w; hdr[19] = (uint8_t)(r->w >> 8); hdr[20] = (uint8_t)(r->w >> 16);
-            hdr[22] = (uint8_t)r->h; hdr[23] = (uint8_t)(r->h >> 8); hdr[24] = (uint8_t)(r->h >> 16);
+            hdr[18] = (uint8_t)td.Width; hdr[19] = (uint8_t)(td.Width >> 8); hdr[20] = (uint8_t)(td.Width >> 16);
+            hdr[22] = (uint8_t)td.Height; hdr[23] = (uint8_t)(td.Height >> 8); hdr[24] = (uint8_t)(td.Height >> 16);
             hdr[26] = 1; hdr[28] = 24;
             fwrite(hdr, 1, 54, f);
             row = (uint8_t *)calloc(1, rowb);
-            for (y = 0; y < r->h; y++) {
-                const uint8_t *src = (const uint8_t *)m.pData + (size_t)(r->h - 1 - y) * m.RowPitch;
-                for (x = 0; x < r->w; x++) {
+            for (y = 0; y < td.Height; y++) {
+                const uint8_t *src = (const uint8_t *)m.pData + (size_t)(td.Height - 1 - y) * m.RowPitch;
+                for (x = 0; x < td.Width; x++) {
                     row[x * 3 + 0] = src[x * 4 + 0];
                     row[x * 3 + 1] = src[x * 4 + 1];
                     row[x * 3 + 2] = src[x * 4 + 2];
@@ -3004,7 +3084,7 @@ static void dump_rt(const RT *r, int force)
             }
             free(row);
             fclose(f);
-            fprintf(stderr, "[D3D11] wrote %s (%ux%u) flip %llu\n", path, r->w, r->h, (unsigned long long)s_flip_count);
+            fprintf(stderr, "[D3D11] wrote %s (%ux%u) flip %llu\n", path, td.Width, td.Height, (unsigned long long)s_flip_count);
         }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
@@ -3031,18 +3111,18 @@ static void write_rt_bmp(const RT *r, const char *path)
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
         f = fopen(path, "wb");
         if (f) {
-            uint32_t rowb = (r->w * 3 + 3) & ~3u, size = 54 + rowb * r->h;
+            uint32_t rowb = (td.Width * 3 + 3) & ~3u, size = 54 + rowb * td.Height;
             uint8_t hdr[54] = { 'B', 'M' };
             uint8_t *row = (uint8_t *)calloc(1, rowb);
             hdr[2] = (uint8_t)size; hdr[3] = (uint8_t)(size >> 8); hdr[4] = (uint8_t)(size >> 16); hdr[5] = (uint8_t)(size >> 24);
             hdr[10] = 54; hdr[14] = 40;
-            hdr[18] = (uint8_t)r->w; hdr[19] = (uint8_t)(r->w >> 8); hdr[20] = (uint8_t)(r->w >> 16);
-            hdr[22] = (uint8_t)r->h; hdr[23] = (uint8_t)(r->h >> 8); hdr[24] = (uint8_t)(r->h >> 16);
+            hdr[18] = (uint8_t)td.Width; hdr[19] = (uint8_t)(td.Width >> 8); hdr[20] = (uint8_t)(td.Width >> 16);
+            hdr[22] = (uint8_t)td.Height; hdr[23] = (uint8_t)(td.Height >> 8); hdr[24] = (uint8_t)(td.Height >> 16);
             hdr[26] = 1; hdr[28] = 24;
             fwrite(hdr, 1, 54, f);
-            for (y = 0; y < r->h; y++) {
-                const uint8_t *src = (const uint8_t *)m.pData + (size_t)(r->h - 1 - y) * m.RowPitch;
-                for (x = 0; x < r->w; x++) {
+            for (y = 0; y < td.Height; y++) {
+                const uint8_t *src = (const uint8_t *)m.pData + (size_t)(td.Height - 1 - y) * m.RowPitch;
+                for (x = 0; x < td.Width; x++) {
                     if (g_dump_alpha) {                    /* the alpha channel as grey */
                         row[x * 3 + 0] = row[x * 3 + 1] = row[x * 3 + 2] = src[x * 4 + 3];
                     } else {
@@ -3101,6 +3181,7 @@ static uint32_t pvideo_reg(uint32_t r)
 typedef struct {
     float rect[4], in[4], size[4], key[4];
     uint32_t on[4];
+    float src[4];
 } OverlayCB;
 
 static float pvideo_scale(uint32_t din_dout, uint32_t out_size)
@@ -3203,14 +3284,86 @@ static RT *s_shown_rt;                 /* what the last present scanned out */
 static RT s_mem_rt;                    /* display memory as a texture (memory_frame) */
 static uint64_t s_last_present_ms, s_last_flip_ms;
 
+/* WM_SIZE: the swap chain takes the new client size, so a bigger window shows
+ * more of the internal resolution instead of a stretched 960x720. */
+static void resize_swap(void)
+{
+    RECT rc;
+    ID3D11Texture2D *bb = NULL;
+    HRESULT hr;
+
+    if (!InterlockedExchange(&s_resized, 0) || !GetClientRect(s_hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0)
+        return;
+    if ((uint32_t)rc.right == s_win_w && (uint32_t)rc.bottom == s_win_h)
+        return;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_back_rtv) { ID3D11RenderTargetView_Release(s_back_rtv); s_back_rtv = NULL; }
+    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, (UINT)rc.right, (UINT)rc.bottom, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) note("ResizeBuffers", hr);
+    else { s_win_w = (uint32_t)rc.right; s_win_h = (uint32_t)rc.bottom; }
+    if (SUCCEEDED(IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&bb))) {
+        ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)bb, NULL, &s_back_rtv);
+        ID3D11Texture2D_Release(bb);
+    }
+    fprintf(stderr, "[D3D11] window %ux%u\n", s_win_w, s_win_h);
+}
+
+/* The window rectangle the 4:3 picture goes in: letterboxed or pillarboxed, or the
+ * whole window with RECOMP_D3D11_STRETCH=1. */
+static void picture_rect(D3D11_VIEWPORT *vp)
+{
+    static int stretch = -1;
+    float w = (float)s_win_w, h = (float)s_win_h;
+    if (stretch < 0) { const char *e = getenv("RECOMP_D3D11_STRETCH"); stretch = e && atoi(e) != 0; }
+    if (!stretch) {
+        if (w * 3.0f > h * 4.0f) w = floorf(h * 4.0f / 3.0f + 0.5f);
+        else h = floorf(w * 3.0f / 4.0f + 0.5f);
+    }
+    vp->TopLeftX = floorf(((float)s_win_w - w) * 0.5f);
+    vp->TopLeftY = floorf(((float)s_win_h - h) * 0.5f);
+    vp->Width = w;
+    vp->Height = h;
+    vp->MinDepth = 0;
+    vp->MaxDepth = 1;
+}
+
+/* The FXAA source: the scanout at the picture's size. */
+static int ensure_post(uint32_t w, uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    if (s_post_tex && s_post_w == w && s_post_h == h)
+        return 1;
+    if (s_post_srv) ID3D11ShaderResourceView_Release(s_post_srv);
+    if (s_post_rtv) ID3D11RenderTargetView_Release(s_post_rtv);
+    if (s_post_tex) ID3D11Texture2D_Release(s_post_tex);
+    s_post_srv = NULL; s_post_rtv = NULL; s_post_tex = NULL;
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_post_tex)))
+        return 0;
+    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_post_tex, NULL, &s_post_rtv);
+    ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_post_tex, NULL, &s_post_srv);
+    s_post_w = w; s_post_h = h;
+    return 1;
+}
+
 /* Scan out `r` (or black) to the window, with the video overlay on top. */
 static void present_frame(RT *r)
 {
-    D3D11_VIEWPORT vp;
+    D3D11_VIEWPORT vp, pic;
     ID3D11ShaderResourceView *srvs[2];
     FLOAT black[4] = { 0, 0, 0, 1 };
     OverlayCB cb;
+    int fx;
 
+    resize_swap();
+    if (!s_back_rtv)
+        return;
     memset(&cb, 0, sizeof cb);
     overlay_update(&cb);
     /* The overlay's coordinates are display pixels: the 640x480 mode. */
@@ -3218,14 +3371,25 @@ static void present_frame(RT *r)
     cb.on[1] = r && r->srv;
     if (!cb.on[1] && !cb.on[0])
         return;
+    picture_rect(&pic);
+    if (cb.on[1]) {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D_GetDesc(r->tex, &td);
+        cb.src[0] = 1.0f / (float)td.Width;
+        cb.src[1] = 1.0f / (float)td.Height;
+        cb.src[2] = (float)td.Width / pic.Width;
+        cb.src[3] = (float)td.Height / pic.Height;
+    }
+    fx = s_fxaa && ensure_post((uint32_t)pic.Width, (uint32_t)pic.Height);
     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_ocb, 0, NULL, &cb, 0, 0);
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
-    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    vp.TopLeftX = vp.TopLeftY = 0;
-    vp.Width = (float)s_win_w;
-    vp.Height = (float)s_win_h;
-    vp.MinDepth = 0;
-    vp.MaxDepth = 1;
+    vp = pic;
+    if (fx) {
+        vp.TopLeftX = vp.TopLeftY = 0;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_post_rtv, NULL);
+    } else {
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    }
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetState(s_ctx, NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
@@ -3241,6 +3405,18 @@ static void present_frame(RT *r)
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     srvs[0] = srvs[1] = NULL;
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srvs);
+    if (fx) {
+        cb.src[0] = 1.0f / pic.Width;
+        cb.src[1] = 1.0f / pic.Height;
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_ocb, 0, NULL, &cb, 0, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back_rtv, NULL);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+        ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &pic);
+        ID3D11DeviceContext_PSSetShader(s_ctx, s_fxps, NULL, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_post_srv);
+        ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, srvs);
+    }
     {
         /* RECOMP_D3D11_OVLDUMP=<prefix>: while the overlay shows, write the
          * window image as <prefix>NNN.bmp every 3 s. */
@@ -3314,9 +3490,9 @@ static RT *memory_frame(void)
                     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
                         for (y = 0; y < h; y++) {
                             uint32_t *g = (uint32_t *)((uint8_t *)mem + va + (size_t)y * pitch);
-                            const uint32_t *hp = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
+                            const uint32_t *hp = (const uint32_t *)((const uint8_t *)m.pData + (size_t)(y * s_res) * m.RowPitch);
                             for (x = 0; x < w; x++)
-                                if (!(g[x] & 0x00FFFFFFu)) { g[x] = hp[x]; n++; }
+                                if (!(g[x] & 0x00FFFFFFu)) { g[x] = hp[x * s_res]; n++; }
                         }
                         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
                     }

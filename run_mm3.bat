@@ -46,6 +46,11 @@ set RECOMP_KEYBOARD=1
 rem A [HITCH] line in run.log for every frame over 60 ms, with the texture /
 rem shader-compile time the back end spent in it (NOTES 35).
 set RECOMP_D3D11_HITCH=60
+rem Picture quality (NOTES 36). Internal resolution = RES x 640x480; above the window size
+rem it is averaged down (supersampling AA). 1 = console resolution, up to 6. The window
+rem can be resized/maximised and keeps 4:3. FXAA=1 adds a cheap edge-smoothing pass.
+set RECOMP_D3D11_RES=2
+rem set RECOMP_D3D11_FXAA=1
 rem Keyboard (arrows, Enter=Start, Z/X/C/V=A/B/X/Y, WASD=left stick, 1/3=triggers) and any XInput pad
 rem drive the game. A synthetic Start pulse (RECOMP_PAD_PRESS=0x10) would pause every race; leave it off.
 rem set RECOMP_PAD_PRESS=0x10
