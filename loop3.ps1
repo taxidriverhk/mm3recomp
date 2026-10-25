@@ -13,7 +13,6 @@ for($r=1;$r -le 1;$r++){
   Copy-Item "$proj\auto.err" "$proj\auto_r$r.err" -Force
   Set-Location $tk
   & $python -m tools.seed_from_log "$proj\auto.err" ..\game_files\default.xbe --functions tools\disasm\output\functions.json --seeds "$proj\config\seed_functions.json" | Select -Last 12
-  & $python "$proj\dropxpp.py"
   & $python "$proj\reseed.py"
 }
 "LOOP3_DONE"

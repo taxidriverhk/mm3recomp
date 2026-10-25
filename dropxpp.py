@@ -1,1 +1,0 @@
-print('xpp drop disabled')

@@ -311,11 +311,43 @@ void sub_00361C31(void)
 }
 
 /* DWORD XInputSetState(HANDLE, PXINPUT_FEEDBACK): stdcall, ret 8 (rumble).
+ * XINPUT_FEEDBACK is packed: header (DWORD dwStatus, HANDLE hEvent, BYTE
+ * Reserved[58]) then XINPUT_RUMBLE at +0x42 (left, low-frequency motor) and
+ * +0x44 (right). sub_001A60A6 fills those from its motor floats (esi+0x88 /
+ * esi+0x8C) once per frame. Forwarded to host pad 0 through the toolkit
+ * (xbox_InputSetState: XInput or SDL), only when the speeds change;
+ * RECOMP_RUMBLE=0 turns it off, as for the OHCI path.
  * Report it complete: the game skips a new request while dwStatus is
  * ERROR_IO_PENDING (0x3E5). */
+typedef struct { uint16_t left, right; } mm3_vibration;
+extern unsigned long xbox_InputSetState(unsigned long port, const mm3_vibration *v);
+
+static void mm3_rumble_off(void)
+{
+    mm3_vibration v = { 0, 0 };
+    xbox_InputSetState(0, &v);
+}
+
 void sub_00361E7B(void)
 {
+    static int on = -1;
+    static mm3_vibration last;
     uint32_t fb = MEM32(g_esp + 8);
+    mm3_vibration v;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RUMBLE");
+        on = !(e && *e == '0');
+        if (on)
+            atexit(mm3_rumble_off);   /* XInput keeps the motors running */
+    }
+    v.left = MEM16(fb + 0x42);
+    v.right = MEM16(fb + 0x44);
+    mm3_pad_trace(5, "XInputSetState", v.left, v.right);
+    /* a pad that was unplugged gets the current speeds once it is back */
+    if (on && (v.left != last.left || v.right != last.right)
+        && xbox_InputSetState(0, &v) == 0)
+        last = v;
     MEM32(fb) = 0;
     g_eax = 0;
     g_esp += 12; /* ret 8 */
