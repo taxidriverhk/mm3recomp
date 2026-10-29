@@ -48,3 +48,6 @@ Thumbs.db
 
 # Compiled vertex programs (built from the game's microcode at run time)
 /shader_cache/
+
+# Launcher: per-user choices
+launcher.user.ini

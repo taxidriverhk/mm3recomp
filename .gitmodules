@@ -2,3 +2,6 @@
 	path = xboxrecomp
 	url = https://github.com/sp00nznet/xboxrecomp.git
 	ignore = dirty
+[submodule "launcher"]
+	path = launcher
+	url = https://github.com/taxidriverhk/recomp-launcher.git
