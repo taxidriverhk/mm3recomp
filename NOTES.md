@@ -15,7 +15,7 @@ user's own disc image.
 | `mm3recomp\config\seed_functions.json` | function-start seeds fed to `tools.disasm` (~9,000) |
 | `mm3recomp\src\recomp_manual.c` | hand-written overrides (replace, not wrap; see below) |
 | `mm3recomp\src\recomp\gen\` | generated C (about 2.2M lines, ~130 files). Regenerated, do not edit |
-| `mm3recomp\run_mm3.bat` | runs the exe with the debug env vars set |
+| `mm3recomp\launcher.ini` | `mm3_launcher.exe` settings: runs the exe with the env vars set (replaced run_mm3.bat) |
 
 Build tooling used: VS 2022 Community (MSVC 19.40), CMake 3.30, Python 3.10 + capstone.
 The project path is long, so builds were done through a `subst M:` drive that maps to

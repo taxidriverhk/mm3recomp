@@ -118,19 +118,20 @@ About a minute. The output is `build\Release\mm3_recomp.exe`.
 
 ## Running
 
-Plug in the gamepad first, then double-click `run_mm3.bat`, or from the repository root:
+Plug in the gamepad first, then double-click `mm3_launcher.exe` in the repository root (the build puts it
+there and next to the game). It is a settings window — resolution, FXAA, vsync, keyboard, rumble, logging —
+that starts the game with the environment variables below and saves your choices to `launcher.user.ini`.
+The options and fixed variables are in `launcher.ini`; the launcher itself is the `launcher/` submodule
+([recomp-launcher](https://github.com/taxidriverhk/recomp-launcher)). `mm3_launcher.exe --play` starts the
+game straight away with the saved settings.
 
-```bat
-run_mm3.bat
-```
-
-The batch file sets the environment variables the port needs (below), starts the exe from the repository root
-and writes the log to `run.log`. A window opens; its title shows FPS and draw count.
+The launcher starts the exe from the repository root and writes its output to `run.log`.
+A window opens; its title shows FPS and draw count.
 Expect about two minutes of intro movies (press Start/Enter to skip ahead), then the title screen.
 The first race compiles its vertex shaders in the background; they are cached in `shader_cache\`
 (git-ignored), so later runs start faster.
 
-The required settings, all in `run_mm3.bat`:
+The required settings, set by `launcher.ini` (the last two are options, on by default):
 
 | Variable | Why |
 |---|---|
@@ -142,7 +143,8 @@ The required settings, all in `run_mm3.bat`:
 | `RECOMP_KEYBOARD=1` | Keyboard → virtual pad (a real pad is merged in either way) |
 | `RECOMP_WATCHDOG_SECS=900` | Print a state dump if the game stops making progress |
 
-Useful optional knobs:
+Useful optional knobs (the launcher has options for resolution, FXAA, vsync, hitch log and rumble; put the
+others in its *Extra environment* box):
 
 | Variable | Effect |
 |---|---|
@@ -151,7 +153,7 @@ Useful optional knobs:
 | `RECOMP_D3D11_SCALE=<f>` | Initial window size, f × 640×480 (default 1.5). The window can be resized or maximised; the picture keeps 4:3 |
 | `RECOMP_D3D11_STRETCH=1` | Fill the window instead of keeping 4:3 |
 | `RECOMP_D3D11_VSYNC=0` | No vsync |
-| `RECOMP_D3D11_HITCH=<ms>` | Log a `[HITCH]` line for every frame slower than this (`run_mm3.bat` sets 60) |
+| `RECOMP_D3D11_HITCH=<ms>` | Log a `[HITCH]` line for every frame slower than this (the launcher's default is 60) |
 | `RECOMP_RUMBLE=0` | Don't forward rumble to the controller |
 
 ## Controls
@@ -302,7 +304,7 @@ thread), and APU / USB-gamepad fixes.
 | `patches/xboxrecomp.patch`, `apply_patches.ps1` | This port's changes to the toolkit, and the script that applies them |
 | `patch_gen.py` | Post-generation patches |
 | `reseed.py`, `loop3.ps1` | Seed discovery from runtime logs |
-| `run_mm3.bat` | Run with the required settings |
+| `launcher.ini`, `launcher/` | Launcher settings, and the launcher itself (submodule); builds `mm3_launcher.exe` |
 | `verify_ps.ps1`, `runtest.ps1`, `runlive.ps1`, `drive_ps.ps1` | Scripted test runs (frame dumps, scripted input) |
 | `src/recomp/gen/` | *(ignored)* generated C |
 | `shader_cache/` | *(ignored)* compiled vertex shaders, built at run time |
