@@ -1,6 +1,6 @@
 # Midtown Madness 3 — Static Recompilation
 
-![Gameplay](https://github.com/user-attachments/assets/6800a589-887e-4c1e-9b14-660017ff122c)
+![Gameplay](https://github.com/user-attachments/assets/22b2e26e-8ae0-4eef-b0b2-8764bb9408a9)
 
 A native Windows (x64) port of the original-Xbox *Midtown Madness 3* (Digital Illusions / Microsoft, 2003),
 produced by **static recompilation**: every x86 function in the retail `default.xbe` is translated to C,
