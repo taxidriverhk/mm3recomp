@@ -72,8 +72,8 @@ The launcher does everything in [Getting the game files](#getting-the-game-files
    **Run setup**. When it is done, press **Play**.
 
 The step-by-step guide, shared by every game that uses the launcher, is
-**[First-time setup](https://github.com/taxidriverhk/recomp-launcher/blob/main/SETUP.md)** (also in
-`launcher\SETUP.md`). It covers choosing the game copy, installing the build tools, what each step does,
+**[First-time setup](https://github.com/taxidriverhk/recomp-launcher#readme)** (also in
+`launcher\README.md`). It covers choosing the game copy, installing the build tools, what each step does,
 troubleshooting, updating and running from a git clone.
 
 What is specific to Midtown Madness 3:
