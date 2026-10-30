@@ -125,7 +125,7 @@ endif()
 
 # ── Launcher ────────────────────────────────────────────────────
 #
-# launcher/ submodule (recomp-launcher): a settings window that starts the game with the options in
+# launcher/ submodule (xbox-recomp-launcher): a settings window that starts the game with the options in
 # launcher.ini, replacing run_*.bat. Built as mm3_launcher.exe next to the game and in the repository root.
 add_subdirectory(launcher)
 recomp_add_launcher(GAME_TARGET ${PROJECT_NAME} OUTPUT_NAME mm3_launcher COPY_TO_SOURCE_DIR)

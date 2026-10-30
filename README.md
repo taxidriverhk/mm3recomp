@@ -72,7 +72,7 @@ The launcher does everything in [Getting the game files](#getting-the-game-files
    **Run setup**. When it is done, press **Play**.
 
 The step-by-step guide, shared by every game that uses the launcher, is
-**[First-time setup](https://github.com/taxidriverhk/recomp-launcher#readme)** (also in
+**[First-time setup](https://github.com/taxidriverhk/xbox-recomp-launcher#readme)** (also in
 `launcher\README.md`). It covers choosing the game copy, installing the build tools, what each step does,
 troubleshooting, updating and running from a git clone.
 
@@ -152,7 +152,7 @@ Plug in the gamepad first, then double-click `mm3_launcher.exe` in the repositor
 there and next to the game). It is a settings window — resolution, FXAA, vsync, keyboard, rumble, logging —
 that starts the game with the environment variables below and saves your choices to `launcher.user.ini`.
 The options and fixed variables are in `launcher.ini`; the launcher itself is the `launcher/` submodule
-([recomp-launcher](https://github.com/taxidriverhk/recomp-launcher)). `mm3_launcher.exe --play` starts the
+([xbox-recomp-launcher](https://github.com/taxidriverhk/xbox-recomp-launcher)). `mm3_launcher.exe --play` starts the
 game straight away with the saved settings.
 
 The launcher starts the exe from the repository root and writes its output to `run.log`.
