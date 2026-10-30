@@ -2,373 +2,100 @@
 
 ![Gameplay](https://github.com/user-attachments/assets/22b2e26e-8ae0-4eef-b0b2-8764bb9408a9)
 
-A native Windows (x64) port of the original-Xbox *Midtown Madness 3* (Digital Illusions / Microsoft, 2003),
-produced by **static recompilation**: every x86 function in the retail `default.xbe` is translated to C,
-compiled with MSVC and linked against a replacement Xbox kernel, audio, input and GPU runtime. No emulator,
-no interpreter, no JIT — the game's own code runs directly on your CPU, and its NV2A GPU command stream is
-rendered with Direct3D 11.
+A native Windows (x64) port of the original-Xbox *Midtown Madness 3* (Digital Illusions / Microsoft, 2003).
+Every x86 function in the retail `default.xbe` is translated to C, compiled with MSVC and linked against a
+replacement Xbox kernel, audio, input and GPU runtime; the NV2A command stream is rendered with Direct3D 11.
+No emulator, interpreter or JIT.
 
-Built on the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit (MIT), pulled in as a git
-submodule at v0.15.0 plus a patch of MM3-driven changes — see [Toolkit changes](#toolkit-changes).
+Built on [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) v0.15.0 (MIT, git submodule) plus
+`patches/xboxrecomp.patch`.
 
-> **No game content is in this repository.** You need your own legally obtained copy of the game. The
-> generated C, the build output and every runtime dump are derived from the game and are git-ignored.
+> **No game content is in this repository.** You need your own copy of the game. Everything derived from it
+> (generated C, builds, dumps) is git-ignored.
 
-**Status: roughly 80 % done — boots, plays the intro movies, loading screens, menus, and full races with audio,
-a gamepad (with rumble), up to 6× internal resolution and a resizable 4:3 window.**
-See [Status](#status) for what works and what doesn't.
+**Status: about 80 % done.** Intro movies, menus and full races (Paris, Washington) with audio, gamepad and
+rumble, ~40–50 fps at 2× internal resolution, resizable 4:3 window.
 
----
+## Quick start
 
-## Contents
+1. Download `mm3recomp-<version>-windows.zip` from [Releases](https://github.com/xbox-games-recomp/mm3recomp/releases)
+   and unzip it to a short path such as `C:\Games`.
+2. Run `mm3_launcher.exe`, choose your disc image or extracted disc folder, press **Run setup**, then **Play**.
 
-- [Requirements](#requirements)
-- [First-time setup with the launcher](#first-time-setup-with-the-launcher)
-- [Getting the game files](#getting-the-game-files)
-- [Building](#building)
-- [Running](#running)
-- [Controls](#controls)
-- [How the recompilation works](#how-the-recompilation-works)
-- [Status](#status)
-- [Repository layout](#repository-layout)
-- [Debugging](#debugging)
-- [Legal](#legal)
+Setup installs the build tools with winget if needed and builds the game (about 17 minutes, ~5 GB). The
+launcher's [player guide](https://github.com/xbox-games-recomp/xbox-recomp-launcher#readme) covers each step and
+troubleshooting.
 
----
+## Game version
 
-## Requirements
+The overrides name guest addresses, so only this executable works:
 
 | | |
 |---|---|
-| OS | Windows 10/11, x64 |
-| Compiler | Visual Studio 2022 (MSVC 19.40+) with the *Desktop development with C++* workload and a Windows SDK |
-| Build tools | CMake 3.20+ (tested with 3.30) |
-| Python | 3.10+ with [capstone](https://www.capstone-engine.org/): `pip install capstone` |
-| GPU | Any Direct3D 11 (feature level 11_0) GPU |
-| Controller | An XInput gamepad (Xbox 360 / One / Series controller) is strongly recommended; the keyboard works too |
-| Game | A **retail Midtown Madness 3 Xbox disc dump** that you own (see below) |
-| Disk | ~5 GB free (game data + ~100 MB generated C + build tree) |
-
-## Getting the source
-
-Clone with the toolkit submodule:
-
-```bash
-git clone --recursive <this repo's URL>
-```
-
-(Already cloned without it? Run `git submodule update --init`.)
-
-## First-time setup with the launcher
-
-The launcher does everything in [Getting the game files](#getting-the-game-files) and
-[Building](#building) for you:
-
-1. Download `mm3recomp-<version>-windows.zip` from this repository's
-   [releases](https://github.com/taxidriverhk/mm3recomp/releases) and unzip it to a short path such as
-   `C:\Games`. It holds the source, the toolkit and the launcher, and no game content.
-2. Run `mm3_launcher.exe`. It opens on the **Setup** page.
-3. Choose your disc image (*Disc image…*) or a folder with the extracted disc (*Folder…*), and press
-   **Run setup**. When it is done, press **Play**.
-
-The step-by-step guide, shared by every game that uses the launcher, is
-**[First-time setup](https://github.com/taxidriverhk/xbox-recomp-launcher#readme)** (also in
-`launcher\README.md`). It covers choosing the game copy, installing the build tools, what each step does,
-troubleshooting, updating and running from a git clone.
-
-What is specific to Midtown Madness 3:
-
-| | |
-|---|---|
-| Game copy | The retail original-Xbox disc, `default.xbe` with the SHA-1 in [Getting the game files](#getting-the-game-files). It goes into `game_files\`. |
-| Build tools | Git, Python 3.10+ with capstone, CMake, Visual Studio 2022 with the C++ workload. The launcher offers to install them with winget. |
-| Build | `regen_once.ps1`: about 17 minutes in testing, about half of it a quiet ABI-analysis phase. |
-| Disk | About 5 GB with the extracted disc. |
-| Rebuild | Setup skips the build once `build\Release\mm3_recomp.exe` exists. After changing code, see [Building](#building). |
-
-A new release is built by pushing a `v*` tag (`.github/workflows/release.yml`).
-
-## Getting the game files
-
-The recompiler and the overrides are tied to one specific executable. Check yours:
-
-| | |
-|---|---|
-| Title ID | `0x4D53002A` |
-| XBE build date | 2003-05-08, XDK 5233 |
+| Title ID | `0x4D53002A` (XBE 2003-05-08, XDK 5233) |
 | `default.xbe` SHA-1 | `e63b03dd956544d3838bead8be5622da6cd189e1` |
 
-Hand-written overrides in `src/recomp_manual.c` name guest addresses (e.g. `XInputGetState` at
-`0x361E0F`). A different revision of the XBE will not work without redoing them.
+Extract the whole disc (including `Data/Shared/WMV`; the game hangs without the intro movies) into
+`game_files\`, e.g. `extract-xiso -x "Midtown Madness 3.iso" -d game_files`.
 
-1. Dump the disc from **your own** console/disc into an ISO (XISO).
-2. Extract it with [extract-xiso](https://github.com/XboxDev/extract-xiso) or
-   [xdvdfs](https://github.com/antangelo/xdvdfs) into `game_files/` at the repository root:
+## Building from source
 
-   ```bash
-   extract-xiso -x "Midtown Madness 3.iso" -d game_files
-   ```
+Needs Windows 10/11, Visual Studio 2022 (C++ workload), CMake 3.20+, Python 3.10+ with `pip install capstone`,
+and a Direct3D 11 GPU.
 
-   You should end up with `game_files/default.xbe` and `game_files/Data/...`.
-   Keep **everything**, including `Data/Shared/WMV` — the game loops on a pure-virtual-call error if the
-   intro movies are missing.
-
-## Building
-
-The commands below run from the repository root, wherever you cloned it. `python` (with capstone) must be
-on `PATH`. CMake comes from `PATH`, or from its default install folder if it isn't there. Set `$env:PYTHON`
-or `$env:CMAKE` to use a specific executable.
-
-### Full regenerate + build (first time, or after changing seeds/overrides)
-
-In PowerShell:
-
-```powershell
-& .\regen_once.ps1
+```bash
+git clone --recursive https://github.com/xbox-games-recomp/mm3recomp.git
 ```
 
-This first applies `patches\xboxrecomp.patch` to the submodule (`apply_patches.ps1`; it skips
-the step if the patch is already in). Then it runs the whole pipeline (below) and
-CMake. It takes **about 15–20 minutes**: disassembly and recompilation of ~4 MB of x86, then MSVC
-compiling ~2.6 million lines of generated C. It prints `BUILD_EXIT=0` at the end. A bad disassembly still
-ends in `BUILD_EXIT=0`, so check that `xboxrecomp\tools\disasm\output\functions.json` got a fresh
-timestamp. If you move the repository, the next run notices that `build\` was configured from the old
-path and reconfigures from scratch.
-
-### Code-only rebuild
-
-After editing `main.c`, `recomp_manual.c`, `d3d11_backend.c` or toolkit sources (no regeneration needed,
-but it needs one full regenerate first):
-
 ```powershell
-cmake --build build --config Release
+& .\regen_once.ps1                     # patch toolkit, lift x86 to C, build (15–20 min, prints BUILD_EXIT=0)
+cmake --build build --config Release   # code-only rebuild (~1 min)
 ```
 
-About a minute. The output is `build\Release\mm3_recomp.exe`.
+The output is `build\Release\mm3_recomp.exe`; `mm3_launcher.exe` is copied to the repository root.
 
 ## Running
 
-Plug in the gamepad first, then double-click `mm3_launcher.exe` in the repository root (the build puts it
-there and next to the game). It is a settings window — resolution, FXAA, vsync, keyboard, rumble, logging —
-that starts the game with the environment variables below and saves your choices to `launcher.user.ini`.
-The options and fixed variables are in `launcher.ini`; the launcher itself is the `launcher/` submodule
-([xbox-recomp-launcher](https://github.com/taxidriverhk/xbox-recomp-launcher)). `mm3_launcher.exe --play` starts the
-game straight away with the saved settings.
-
-The launcher starts the exe from the repository root and writes its output to `run.log`.
-A window opens; its title shows FPS and draw count.
-Expect about two minutes of intro movies (press Start/Enter to skip ahead), then the title screen.
-The first race compiles its vertex shaders in the background; they are cached in `shader_cache\`
-(git-ignored), so later runs start faster.
-
-The required settings, set by `launcher.ini` (the last two are options, on by default):
-
-| Variable | Why |
-|---|---|
-| `RECOMP_D3D11=1` | Render on the GPU through `src/d3d11_backend.c` (without it: the toolkit's CPU rasteriser, ~1 fps) |
-| `RECOMP_PB_EXEC=1` | Execute the NV2A pushbuffer (implied by `RECOMP_D3D11`) |
-| `RECOMP_AC97_READY=1` | Report the AC'97 codec ready and start the emulated APU, so `DirectSoundCreate` succeeds |
-| `RECOMP_HEAP_RECLAIM=1` | Honour `MmFreeContiguousMemory`; otherwise the 64 MB arena fills while a city loads |
-| `RECOMP_DISPATCH_GATE=1` | One thread at DISPATCH_LEVEL at a time, as on the console (DirectSound DPC race otherwise) |
-| `RECOMP_KEYBOARD=1` | Keyboard → virtual pad (a real pad is merged in either way) |
-| `RECOMP_WATCHDOG_SECS=900` | Print a state dump if the game stops making progress |
-
-Useful optional knobs (the launcher has options for resolution, FXAA, vsync, hitch log and rumble; put the
-others in its *Extra environment* box):
+`mm3_launcher.exe` sets resolution, FXAA, vsync, keyboard, rumble and logging, saves them to
+`launcher.user.ini` and logs to `run.log`; `--play` skips the window. The required environment variables are
+in `launcher.ini`. Useful extras for the *Extra environment* box:
 
 | Variable | Effect |
 |---|---|
-| `RECOMP_D3D11_RES=<n>` | Internal resolution: n × 640×480 (default 2 = 1280×960, max 6). Above the window size it is averaged down, which is supersampling anti-aliasing; 1 = the console's own resolution |
-| `RECOMP_D3D11_FXAA=1` | FXAA pass over the final picture (cheap; softens HUD text slightly) |
-| `RECOMP_D3D11_SCALE=<f>` | Initial window size, f × 640×480 (default 1.5). The window can be resized or maximised; the picture keeps 4:3 |
+| `RECOMP_D3D11_RES=<n>` | Internal resolution n × 640×480 (default 2, max 6), averaged down to the window |
+| `RECOMP_D3D11_SCALE=<f>` | Initial window size f × 640×480 (default 1.5) |
 | `RECOMP_D3D11_STRETCH=1` | Fill the window instead of keeping 4:3 |
-| `RECOMP_D3D11_VSYNC=0` | No vsync |
-| `RECOMP_D3D11_HITCH=<ms>` | Log a `[HITCH]` line for every frame slower than this (the launcher's default is 60) |
-| `RECOMP_RUMBLE=0` | Don't forward rumble to the controller |
+| `RECOMP_D3D11_HITCH=<ms>` | Log every frame slower than this |
 
-## Controls
+**Controls:** the first XInput pad maps 1:1 to the Xbox pad. Keyboard: WASD steer, IJKL right stick, arrows
+D-pad, Z/X/C/V = A/B/X/Y, Q/E = White/Black, 1/3 = brake/gas, Enter = Start, Backspace = Back.
 
-Player 1 is the first XInput controller; it maps 1:1 onto the Xbox controller (Duke/S) the game expects.
-The keyboard works at the same time:
-
-| Xbox | Keyboard |
-|---|---|
-| Left stick (steer) | W / A / S / D |
-| Right stick | I / J / K / L |
-| D-pad | Arrow keys |
-| A / B / X / Y | Z / X / C / V |
-| White / Black | Q / E |
-| Left / Right trigger (brake / gas) | 1 / 3 |
-| Start | Enter |
-| Back | Backspace |
-
-Rumble: the game's `XInputSetState` calls are forwarded to the first controller (left = low-frequency motor,
-right = high-frequency). `RECOMP_RUMBLE=0` turns it off.
-
----
-
-## How the recompilation works
+## How it works
 
 ```
- default.xbe ──► xbe_parser ──► disasm ──► func_id ──► abi_analysis ──► recomp ──► patch_gen.py ──► MSVC
-                  (sections,     (recursive  (CRT/XDK   (calling         (x86 → C,    (text fixes      │
-                   imports)       descent +   library    conventions,     250 fns       to the          ▼
-                                  seeds)      matching)  stack frames)    per file)     generated C)  mm3_recomp.exe
-                                                                                                        │
-                       xboxrecomp runtime: kernel · memory · threads · file I/O · DirectSound/APU ·     │ links
-                       XInput · NV2A pushbuffer executor  +  mm3recomp: overrides · D3D11 back end ◄────┘
+default.xbe ─► disasm ─► func_id ─► abi_analysis ─► recomp ─► patch_gen.py ─► MSVC ─► mm3_recomp.exe
+               (capstone + seeds in config/seed_functions.json)      (x86 → C)         + xboxrecomp runtime
 ```
 
-### 1. Lifting x86 to C (offline)
+- **xboxrecomp** supplies the Xbox kernel, an emulated MCPX APU (→ XAudio2), XInput and the NV2A pushbuffer
+  executor.
+- **`src/recomp_manual.c`** replaces guest functions that depend on hardware (GPU fence, video overlay, XNet,
+  XAPI gamepad calls).
+- **`src/d3d11_backend.c`** translates NV2A vertex programs to HLSL, runs the register combiners in one
+  data-driven pixel shader, and handles render-to-texture, w-buffering, supersampling and Bink overlays.
 
-The Python pipeline in `xboxrecomp/tools/` reads the XBE and emits C:
+`NOTES.md` is the engineering log (every bug, cause and fix, plus debug recipes). Read it before changing
+anything.
 
-- **`disasm`** does recursive-descent disassembly with capstone. Statically it only finds code reachable through
-  direct calls, so it is fed **seeds** — `config/seed_functions.json`, ~9,000 function starts
-  collected from runtime logs of indirect calls (vtables, callbacks, jump tables) that hit unknown targets.
-  `--extra-sections DSOUND,XACTENG,WMADEC,XGRPH` also sweeps those XDK library sections, which matters:
-  an unswept library section shows up as a burst of *"ICALL Failed to resolve"* and broken behaviour
-  (this was the cause of both the DirectSound crash and every pixel shader failing to assemble).
-- **`func_id`** recognises CRT/XDK library functions; **`abi_analysis`** works out calling conventions and frames.
-- **`recomp`** turns each function into a C function. The guest's registers are C variables, guest memory is
-  one flat 32-bit address space accessed through `MEM8/16/32` macros, flags are computed lazily, and indirect
-  calls go through a binary-search dispatch table of all known function addresses. Output lands in
-  `src/recomp/gen/` (~144 files, ~2.6 M lines). Never edit it — it's regenerated.
-- **`patch_gen.py`** applies a few anchored text patches to the generated C (e.g. a divide-by-zero guard in
-  DirectSound, the pedestrian LOD fix). An anchor that stops matching is reported.
+## Open issues
 
-`regen.ps1` is the whole sequence. `reseed.py` / `tools.seed_from_log` turn unresolved-call logs into new seeds.
-
-### 2. The runtime (xboxrecomp)
-
-At run time the recompiled code thinks it is on an Xbox. The toolkit provides:
-
-- a reimplementation of the **Xbox kernel** exports the game imports (memory, threads, events, DPCs, IRQL,
-  file I/O with path translation to `game_files\`, EEPROM, …);
-- an emulated **MCPX APU** (voice processor) under the game's own statically linked DirectSound/XACT/WMA code,
-  mixed to XAudio2;
-- the **input** layer (XInput + keyboard) that feeds the Xbox `XINPUT_STATE` the game polls;
-- the **NV2A pushbuffer executor**: the game's own Direct3D 8 (statically linked XDK D3D) writes GPU
-  commands into a ring buffer exactly as on hardware; the executor parses those methods and tracks GPU state
-  (vertex programs, register combiners, textures, surfaces) and hands draws to a back end.
-
-### 3. The game layer (this repository)
-
-- **`src/main.c`** — boot: maps memory, loads the XBE image, starts the APU, kernel and back end, then jumps to the
-  recompiled entry point.
-- **`src/recomp_manual.c`** — hand-written replacements for individual guest functions, where the original depends
-  on real hardware behaviour. Examples: the D3D GPU fence wait (made honest against the executor's semaphore),
-  the video-overlay stop used by Bink movies, XNet (forced "no network"), and the XAPI gamepad calls
-  (`XGetDevices`, `XInputOpen`, `XInputGetState`, `XInputSetState` for rumble, …) which are answered directly
-  instead of emulating USB.
-- **`src/d3d11_backend.c`** — the GPU renderer:
-  - NV2A **vertex programs are translated to HLSL** and run on the GPU (this took the frame rate from ~8 to ~40–50 fps);
-  - the **register combiners** (8 general stages + final combiner) are a single data-driven HLSL pixel shader, so
-    there are no shader permutations; texture-stage modes including cube maps and the dot-product/`texm3x3` modes;
-  - render targets are D3D11 textures keyed by guest address, so render-to-texture and the game's post chain
-    (colour grade, glare, depth-based haze) work; depth buffers can be read back as textures the way the game does;
-  - textures (swizzled, DXT, palettised…) are decoded on first use and re-decoded when their guest bytes change;
-  - MM3 **w-buffers** its scene (linear depth); the back end writes w as depth for those draws, which the
-    distance-haze pass needs;
-  - CPU writes into a render target (the loading-screen TGA is decoded straight into the back buffer) are
-    picked up from guest memory;
-  - everything renders at an **internal resolution** of n × 640×480 and is averaged down at present
-    (supersampling), with optional FXAA, letterboxed 4:3 in a resizable window;
-  - vertex shaders compile on a worker thread (the CPU interpreter covers the gap) and are cached on disk;
-  - Bink movies drawn through the NV2A video overlay are composited at present time.
-
-`NOTES.md` is the detailed engineering log: every bug found, why, and how it was fixed — read it before
-changing anything.
-
-### Toolkit changes
-
-`xboxrecomp/` is a git submodule pinned to upstream **v0.15.0** (`6376eb8`). The changes made for this port
-live in `patches/xboxrecomp.patch` (9 files) and are applied on top by `apply_patches.ps1`; the
-submodule is set to `ignore = dirty`, so the patched files don't show up as changes in this repo.
-After changing toolkit files, regenerate the patch with
-`git -C xboxrecomp diff > patches/xboxrecomp.patch`. The patch mainly covers:
-`nv2a_backend.h` / `nv2a_pb_exec.c` (`draw_ext`: full combiner, four texture stages, fog, clip state,
-`SET_CONTROL0` for the w-buffer and extra vertex outputs handed to back ends), the pushbuffer ring-wrap fix in
-`nv2a_pb_scan.c`, the inline-array vertex sizing fix, vertex-program interpreter defaults/`ARL` rounding in
-`nv2a_vsh_interp.c`, the executor's stats report made opt-in (`xbox_memory_layout.c`; it stalled the GPU
-thread), and APU / USB-gamepad fixes.
-
----
-
-## Status
-
-**Works**
-
-- Boot, the three intro movies (with sound), title screen, profile, menus, car select
-- Loading screens with their artwork (`Startup.tga` at boot, per-city images before races) and the meter
-- Full races in **Paris** and **Washington** with correct colours, HUD, minimap, pedestrians, traffic, water
-  and the distance haze, ~40–50 fps on the GPU at 2× internal resolution
-- Audio: music, effects and movie sound via the emulated APU → XAudio2
-- Gamepad and keyboard input; rumble forwarded to the controller
-- Supersampling (`RECOMP_D3D11_RES`), optional FXAA, resizable window that keeps 4:3
-- 10+ minute sessions without a crash
-
-**Open issues**
-
-1. **Short hitches when a race loads** (~3.8 s, textures decoded at once) and on the results screen; the
-   first stream-in of new shaders costs a few ~50 ms frames on the first run (cached afterwards).
+1. Short hitches when a race loads and on the results screen.
 2. The colour-grade pass is missing in about 1 frame in 300.
-3. 44 recompiled functions read CPU flags set by their caller (split chunks); one of them broke the loading
-   screen and was patched, the rest are unchecked (`NOTES.md` 37). A lifter fix would cover them all.
-4. Rumble is forwarded but not yet confirmed by feel in a race.
-5. No MSAA (deliberately; supersampling instead, see `NOTES.md` 36).
-6. Xbox Live / System Link: XNet is stubbed out, no networking.
-
-## Repository layout
-
-| Path | What it is |
-|---|---|
-| `CMakeLists.txt` | Builds `mm3_recomp.exe` from the generated C + game sources + toolkit |
-| `src/main.c` | Boot / entry |
-| `src/recomp_manual.c` | Hand-written guest-function overrides |
-| `src/d3d11_backend.c` | Direct3D 11 renderer for the NV2A executor |
-| `src/dstrace.inc` | Generated DirectSound/XACT call-trace wrappers (`RECOMP_DSTRACE=1`) |
-| `src/sampler.c` | Game-thread sampling profiler (`RECOMP_SAMPLE=1`) |
-| `config/seed_functions.json` | Disassembler seeds |
-| `regen.ps1`, `regen_once.ps1` | Full pipeline + build |
-| `patches/xboxrecomp.patch`, `apply_patches.ps1` | This port's changes to the toolkit, and the script that applies them |
-| `patch_gen.py` | Post-generation patches |
-| `reseed.py`, `loop3.ps1` | Seed discovery from runtime logs |
-| `launcher.ini`, `launcher/` | Launcher settings, and the launcher itself (submodule); builds `mm3_launcher.exe` |
-| `verify_ps.ps1`, `runtest.ps1`, `runlive.ps1`, `drive_ps.ps1` | Scripted test runs (frame dumps, scripted input) |
-| `src/recomp/gen/` | *(ignored)* generated C |
-| `shader_cache/` | *(ignored)* compiled vertex shaders, built at run time |
-| `xboxrecomp/` | The recompilation toolkit (MIT), git submodule |
-| `NOTES.md` | Engineering log |
-| `game_files/` | *(ignored)* your extracted disc |
-
-## Debugging
-
-A few starting points (many more in `NOTES.md` → "Debug recipes"):
-
-- `RECOMP_STUB_LOG=1` logs each call to an address the disassembler never found. A run of these in one library
-  section means that section needs `--extra-sections`; isolated ones need seeds.
-- `RECOMP_WATCH=<va>` names the code that writes a guest address.
-- `RECOMP_D3D11_DUMP=<prefix>` + `RECOMP_D3D11_DUMP_MS=<ms>` save presented frames as BMP;
-  `RECOMP_D3D11_LOGFRAME=<a>-<b>` logs every draw of those frames (state, combiners, textures, vertex program hash).
-- The exe has a PDB, so the crash handler and cdb/WinDbg map a host RIP back to `sub_XXXXXXXX`, i.e. the guest
-  function. Exit codes: `-1073741819` access violation, `-1073741676` divide by zero, `-1073741571` stack overflow.
-- `verify_ps.ps1 <tag>` runs a scripted race and dumps frames to `frames\<tag>` (the race starts ~4 min in).
-  Scripted pad input works in menus but does not drive the car in a race.
-- `RECOMP_D3D11_HITCH=<ms>` and `RECOMP_SAMPLE=1` find frame stalls; `RECOMP_PAD_TRACE=1` logs the XAPI pad
-  calls (including rumble speeds).
-- stderr goes through a pipe drained by a logger thread so logging never blocks the game; `RECOMP_LOG_SYNC=1`
-  writes directly.
+3. 44 recompiled functions read flags set by their caller; one was patched, the rest are unchecked.
+4. No MSAA (supersampling instead); no Xbox Live / System Link.
 
 ## Legal
 
-This is an independent, non-commercial preservation and research project. It is not affiliated with or
-endorsed by Microsoft, Xbox Game Studios, Digital Illusions CE (DICE) or Volkswagen.
-*Midtown Madness* and all related assets are the property of their respective owners.
-
-This repository contains **no game code, data or assets**: no XBE, no disc content, no generated C, no builds.
-To use it you must own the game and extract the files from your own disc. Do not open issues or pull requests
-containing game files, generated code or links to them.
-
-The toolkit in `xboxrecomp/` is MIT-licensed (see `xboxrecomp/LICENSE`, `xboxrecomp/NOTICE` and
-`xboxrecomp/LICENSES/` for third-party components).
+An independent, non-commercial preservation project, not affiliated with Microsoft, Xbox Game Studios,
+Digital Illusions CE or Volkswagen. *Midtown Madness* is the property of its owners. Do not open issues or pull
+requests containing game files or generated code. The toolkit in `xboxrecomp/` is MIT-licensed.

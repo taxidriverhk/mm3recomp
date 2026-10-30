@@ -4,4 +4,4 @@
 	ignore = dirty
 [submodule "launcher"]
 	path = launcher
-	url = https://github.com/taxidriverhk/xbox-recomp-launcher.git
+	url = https://github.com/xbox-games-recomp/xbox-recomp-launcher.git
