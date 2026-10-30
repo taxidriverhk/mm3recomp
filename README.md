@@ -61,25 +61,30 @@ git clone --recursive <this repo's URL>
 
 ## First-time setup with the launcher
 
-The launcher can do everything in [Getting the game files](#getting-the-game-files) and
-[Building](#building) for you.
+The launcher does everything in [Getting the game files](#getting-the-game-files) and
+[Building](#building) for you:
 
 1. Download `mm3recomp-<version>-windows.zip` from this repository's
-   [releases](https://github.com/taxidriverhk/mm3recomp/releases) and unzip it, preferably to a short path
-   such as `C:\Games`. The zip holds the source, the toolkit and the launcher, and no game content.
-
-   (From a clone instead: build the launcher from the submodule in a few seconds with
-   `cmake -S launcher -B launcher/build` and `cmake --build launcher/build --config Release`, then run
-   `launcher\build\Release\recomp_launcher.exe`.)
+   [releases](https://github.com/taxidriverhk/mm3recomp/releases) and unzip it to a short path such as
+   `C:\Games`. It holds the source, the toolkit and the launcher, and no game content.
 2. Run `mm3_launcher.exe`. It opens on the **Setup** page.
-3. Choose your disc image (*Disc image…*, an XISO or a full dump) or the folder of an already extracted disc
-   (*Folder…*, linked as `game_files\` with a directory junction), and press **Run setup**.
+3. Choose your disc image (*Disc image…*) or a folder with the extracted disc (*Folder…*), and press
+   **Run setup**. When it is done, press **Play**.
 
-It checks for Git, Python, capstone, CMake and Visual Studio. If any are missing, it offers to install them
-with winget, which can take a while (Visual Studio especially). It then extracts the disc into
-`game_files\` and checks `default.xbe` against the SHA-1 below. Finally it fetches the toolkit submodule if
-needed and runs `regen_once.ps1` (about 17 minutes). A progress bar and the output show in the window, and the
-output also goes to `setup.log`. When it finishes, press **Play**.
+The step-by-step guide, shared by every game that uses the launcher, is
+**[First-time setup](https://github.com/taxidriverhk/recomp-launcher/blob/main/SETUP.md)** (also in
+`launcher\SETUP.md`). It covers choosing the game copy, installing the build tools, what each step does,
+troubleshooting, updating and running from a git clone.
+
+What is specific to Midtown Madness 3:
+
+| | |
+|---|---|
+| Game copy | The retail original-Xbox disc, `default.xbe` with the SHA-1 in [Getting the game files](#getting-the-game-files). It goes into `game_files\`. |
+| Build tools | Git, Python 3.10+ with capstone, CMake, Visual Studio 2022 with the C++ workload. The launcher offers to install them with winget. |
+| Build | `regen_once.ps1`: about 17 minutes in testing, about half of it a quiet ABI-analysis phase. |
+| Disk | About 5 GB with the extracted disc. |
+| Rebuild | Setup skips the build once `build\Release\mm3_recomp.exe` exists. After changing code, see [Building](#building). |
 
 A new release is built by pushing a `v*` tag (`.github/workflows/release.yml`).
 
