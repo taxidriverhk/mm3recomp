@@ -1,5 +1,5 @@
 ﻿import json,os,re,bisect,sys
-PROJ=os.path.dirname(os.path.abspath(__file__))
+PROJ=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TK=os.path.join(PROJ,'xboxrecomp')
 fl=json.load(open(os.path.join(TK,'tools','disasm','output','functions.json')))
 v=lambda x:int(x,16) if isinstance(x,str) else x

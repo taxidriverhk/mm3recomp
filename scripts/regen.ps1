@@ -1,6 +1,6 @@
 ﻿$ErrorActionPreference = "Continue"
-# Paths are relative to this script, so the repo can live anywhere.
-$proj = $PSScriptRoot
+# Paths are relative to this script (in <repo>\scripts), so the repo can live anywhere.
+$proj = Split-Path $PSScriptRoot -Parent
 $tk = Join-Path $proj "xboxrecomp"
 $xbe = "..\game_files\default.xbe"   # relative to $tk, i.e. <repo>\game_files
 
@@ -13,7 +13,7 @@ $cmake = if ($env:CMAKE) { $env:CMAKE }
 if (-not (Test-Path (Join-Path $proj "game_files\default.xbe"))) {
     throw "game_files\default.xbe not found. Extract your Midtown Madness 3 disc into game_files\ (see README)."
 }
-& (Join-Path $proj "apply_patches.ps1")
+& (Join-Path $PSScriptRoot "apply_patches.ps1")
 
 Set-Location $tk
 # XBE header/section analysis; tools.disasm picks up <xbe stem>_analysis.json next to the XBE.
@@ -23,7 +23,7 @@ Set-Location $tk
 & $python -m tools.abi_analysis $xbe
 Remove-Item "$proj\src\recomp\gen\*" -Force -ErrorAction SilentlyContinue
 & $python -m tools.recomp $xbe --game-name "Midtown Madness 3" --all --split 250 --gen-dir "$proj\src\recomp\gen" --exclude-manual "$proj\src\recomp_manual.c"
-& $python "$proj\patch_gen.py"
+& $python "$PSScriptRoot\patch_gen.py"
 Set-Location $proj
 
 # A build tree configured from another path (e.g. an old subst drive) cannot be reused: start it again.

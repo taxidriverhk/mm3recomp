@@ -48,7 +48,7 @@ git clone --recursive https://github.com/xbox-games-recomp/mm3recomp.git
 ```
 
 ```powershell
-& .\regen_once.ps1                     # patch toolkit, lift x86 to C, build (15–20 min, prints BUILD_EXIT=0)
+& .\scripts\regen_once.ps1             # patch toolkit, lift x86 to C, build (15–20 min, prints BUILD_EXIT=0)
 cmake --build build --config Release   # code-only rebuild (~1 min)
 ```
 

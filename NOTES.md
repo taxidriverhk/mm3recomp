@@ -24,7 +24,7 @@ CMake's cache has `M:/...` paths in it. From `D:\...` directly, reconfigure firs
 
 ## Pipeline (what the scripts do)
 
-`mm3recomp\regen.ps1`: disasm (with seeds) -> func_id -> abi_analysis -> recompile
+`mm3recomp\scripts\regen.ps1`: disasm (with seeds) -> func_id -> abi_analysis -> recompile
 (`--all --split 250 --exclude-manual src\recomp_manual.c`) -> cmake build.
 `mm3recomp\scripts\dev\loop3.ps1`: N rounds of regen, 60 s boot (AC97 ready), `tools.seed_from_log`
 on the log, reseed from unresolved stubs (`reseed.py`). Per-round logs: `auto_r1..3.err`.
@@ -86,8 +86,8 @@ on the log, reseed from unresolved stubs (`reseed.py`). Per-round logs: `auto_r1
 
 ## Pipeline additions since the first notes
 
-* `mm3recomp\patch_gen.py`: text patches applied to generated C after the recompile (run by regen.ps1).
-* `mm3recomp\regen_once.ps1`: one regenerate+build, no seeding. Prefer this now.
+* `mm3recomp\scripts\patch_gen.py`: text patches applied to generated C after the recompile (run by regen.ps1).
+* `mm3recomp\scripts\regen_once.ps1`: one regenerate+build, no seeding. Prefer this now.
 * `loop3.ps1` reseeds automatically and changes behaviour round to round. Avoid it unless a
   new stub shows up. `reseed.py` / `tools.seed_from_log` are the manual tools.
 * `snapshots\mm3_recomp_attract.exe(.pdb)`: a known-good build that reaches attract mode.

@@ -4,7 +4,7 @@ Each patch is (file-glob, anchor text, replacement). The anchor must be found in
 one place; a missing anchor is reported (the generated code changed under us).
 """
 import glob,os,sys,re
-GEN=os.path.join(os.path.dirname(os.path.abspath(__file__)),'src','recomp','gen','').replace('\\','/')
+GEN=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),'src','recomp','gen','').replace('\\','/')
 PATCHES=[
  # XDK DSOUND (sub_0027CC4F): divides by byte [ecx+0x64] before checking it for zero.
  # The real hardware path never sees zero here; our DSOUND state machine can leave it
