@@ -23,6 +23,7 @@ See [Status](#status) for what works and what doesn't.
 ## Contents
 
 - [Requirements](#requirements)
+- [First-time setup with the launcher](#first-time-setup-with-the-launcher)
 - [Getting the game files](#getting-the-game-files)
 - [Building](#building)
 - [Running](#running)
@@ -57,6 +58,30 @@ git clone --recursive <this repo's URL>
 ```
 
 (Already cloned without it? Run `git submodule update --init`.)
+
+## First-time setup with the launcher
+
+The launcher can do everything in [Getting the game files](#getting-the-game-files) and
+[Building](#building) for you. Install the [requirements](#requirements) and clone the repository, then:
+
+1. Get the launcher: download `recomp_launcher.exe` from the
+   [recomp-launcher releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the repository
+   root, or build it from the submodule in a few seconds:
+
+   ```powershell
+   cmake -S launcher -B launcher/build
+   cmake --build launcher/build --config Release
+   ```
+
+   (The exe is `launcheruild\Releaseecomp_launcher.exe`.)
+2. Run it. It opens on the **Setup** page.
+3. Choose your disc image (*Disc image…*, an XISO or a full dump) or the folder of an already extracted disc
+   (*Folder…*, linked as `game_files\` with a directory junction), and press **Run setup**.
+
+It checks for Git, Python with capstone, CMake and Visual Studio. It then extracts the disc into
+`game_files\` and checks `default.xbe` against the SHA-1 below. Finally it fetches the toolkit submodule and
+runs `regen_once.ps1`. Its output shows in the window and goes to `setup.log`. When it finishes, press
+**Play**. The build has also put `mm3_launcher.exe` in the repository root; use that one from now on.
 
 ## Getting the game files
 
