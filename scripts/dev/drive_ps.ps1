@@ -2,9 +2,9 @@
 # (Start pulses at boot can leave the race paused; A on the pause menu resumes).
 # usage: drive_ps.ps1 <tag> [secs] [dumpms] [steer pattern, e.g. "lleft,,lright,"] [gas button]
 param([string]$tag = "drv", [int]$secs = 600, [int]$dumpms = 5000, [string]$steer = ",lleft,,,lright,,", [string]$gas = "rt")
-Set-Location $PSScriptRoot
+$root = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent; Set-Location $root
 Get-Process mm3_recomp -ErrorAction SilentlyContinue | Stop-Process -Force
-$live = Join-Path $PSScriptRoot "pad_live.txt"
+$live = Join-Path $root "pad_live.txt"
 "" | Out-File $live -Encoding ascii
 New-Item -ItemType Directory -Force "frames\$tag" | Out-Null
 Remove-Item "frames\$tag\*.bmp" -ErrorAction SilentlyContinue

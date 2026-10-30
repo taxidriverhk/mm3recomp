@@ -1,4 +1,4 @@
-﻿$proj = $PSScriptRoot; $tk = Join-Path $proj "xboxrecomp"
+﻿$proj = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent; $tk = Join-Path $proj "xboxrecomp"
 $python = if ($env:PYTHON) { $env:PYTHON } else { "python" }
 for($r=1;$r -le 1;$r++){
   "ROUND $r"

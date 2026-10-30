@@ -26,7 +26,7 @@ CMake's cache has `M:/...` paths in it. From `D:\...` directly, reconfigure firs
 
 `mm3recomp\regen.ps1`: disasm (with seeds) -> func_id -> abi_analysis -> recompile
 (`--all --split 250 --exclude-manual src\recomp_manual.c`) -> cmake build.
-`mm3recomp\loop3.ps1`: N rounds of regen, 60 s boot (AC97 ready), `tools.seed_from_log`
+`mm3recomp\scripts\dev\loop3.ps1`: N rounds of regen, 60 s boot (AC97 ready), `tools.seed_from_log`
 on the log, reseed from unresolved stubs (`reseed.py`). Per-round logs: `auto_r1..3.err`.
 
 ## Findings (in the order they were hit)
@@ -202,13 +202,13 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     were culled. Odd strip triangles are now swapped in both executor paths. The car renders as a coherent, silver
     hatchback with tail lights, plate and exhaust. Env-map reflections (cube map) are still only face 0 of the 2D sample.
     Remaining: two red HUD quads near the car, thin dark slivers in some frames, and `RECOMP_PAD_PRESS` pauses the race
-    (use `runlive.ps1`: Start pulses until a time, then `a` via `RECOMP_PAD_LIVE`).
+    (use `scripts\dev\runlive.ps1`: Start pulses until a time, then `a` via `RECOMP_PAD_LIVE`).
     Tools added (all env vars): `RECOMP_VSH_TRACE=<n>` with `RECOMP_VSH_TRACE_PROG=<hash>` / `_ZERO=1`, `RECOMP_VSH_DUMP=1`
     (programme disassembly with a hash; `_DUMP_CONSTS=1` for constant loads), `RECOMP_VSH_WATCH=<c index>`,
     `RECOMP_PAD_PRESS_UNTIL_MS`; in the back end `RECOMP_D3D11_DBG=1..7` (1 d0, 2 tex0, 3 d1, 4-6 tex1-3, 7 d0.a),
     `_ONLYPROG`/`_SKIPPROG=<hash>`, `_SNAP=<flip>,<every>` + `_SNAPRANGE=<lo>-<hi>` (filmstrip of the presented surface;
     `every` 0 = dump each surface the title leaves), `_LOGFRAME` now also logs clears, depth range and the programme hash.
-    Scripts: `runtest.ps1`, `dbgmodes.ps1`, `progmodes.ps1`, `ftrace.ps1` (one-frame method trace). A good build is
+    Scripts: `scripts\dev\runtest.ps1`, `dbgmodes.ps1`, `progmodes.ps1`, `ftrace.ps1` (one-frame method trace). A good build is
     `snapshots\mm3_recomp_d3d11.exe`.
 23. **Keyboard / gamepad in the D3D11 window.** The back end's window forwards `WM_KEYDOWN/UP` into the toolkit's key
     table (`input/keyboard.c`) and `main.c` turns `RECOMP_KEYBOARD` on with the back end: arrows = D-pad, Enter = Start,
@@ -331,7 +331,7 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     u64 program size that follows it). xemu had 5-stage combiners for buildings (`cc 00011105`, fin `14080400`), 3 for
     the road (fin `00000D0F 0D0B1C80`), 5 for the car (fin `1D090D00`); we had 1.
     Fix: `regen.ps1` now passes `--extra-sections DSOUND,XACTENG,WMADEC,XGRPH`, and seeds `0x338B41`, `0x338D97`.
-    Result (`verify_ps.ps1`, frames `frames\xg`): building/road programmes now draw with exactly xemu's combiners; textured
+    Result (`scripts\dev\verify_ps.ps1`, frames `frames\xg`): building/road programmes now draw with exactly xemu's combiners; textured
     asphalt and kerbs, cream/grey facades, trees, silver car with red lights and dark glass. Snapshot
     `snapshots\mm3_recomp_xgrph.exe`. Beware: a broken `tools.disasm` command line still exits the regen with
     `BUILD_EXIT=0` (it reuses the old disassembly) -- check `tools\disasm\output\functions.json`'s date.
@@ -478,7 +478,7 @@ Snapshots: `snapshots\mm3_recomp_world.exe(.pdb)` with `config\seed_functions.wo
     the texture decode/upload and vertex-programme compile time the back end spent in it) and `RECOMP_SAMPLE=1`
     (`src/sampler.c`: samples the game thread every 1 ms, unwinds 12 frames, splits samples into slow / normal
     frames by the flip interval, `[SAMPLE]` tables every 60 s resolved through the PDB). Scripted driving:
-    `drive_ps.ps1 <tag> [secs] [dumpms] [steer] [gas]` -- but in races neither `rt` nor `a` moves the car
+    `scripts\dev\drive_ps.ps1 <tag> [secs] [dumpms] [steer] [gas]` -- but in races neither `rt` nor `a` moves the car
     (menus take A fine), so these runs are mostly a standing car with traffic; the user's own driving is
     the real test. Found, in order of size:
     - **The executor's 10 s stats report** (`nv2a_pb_scan_report`: `[TEXUSE]`, `[GPU]` method counts) ran on
