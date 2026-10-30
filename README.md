@@ -62,26 +62,26 @@ git clone --recursive <this repo's URL>
 ## First-time setup with the launcher
 
 The launcher can do everything in [Getting the game files](#getting-the-game-files) and
-[Building](#building) for you. Install the [requirements](#requirements) and clone the repository, then:
+[Building](#building) for you.
 
-1. Get the launcher: download `recomp_launcher.exe` from the
-   [recomp-launcher releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the repository
-   root, or build it from the submodule in a few seconds:
+1. Download `mm3recomp-<version>-windows.zip` from this repository's
+   [releases](https://github.com/taxidriverhk/mm3recomp/releases) and unzip it, preferably to a short path
+   such as `C:\Games`. The zip holds the source, the toolkit and the launcher, and no game content.
 
-   ```powershell
-   cmake -S launcher -B launcher/build
-   cmake --build launcher/build --config Release
-   ```
-
-   (The exe is `launcheruild\Releaseecomp_launcher.exe`.)
-2. Run it. It opens on the **Setup** page.
+   (From a clone instead: build the launcher from the submodule in a few seconds with
+   `cmake -S launcher -B launcher/build` and `cmake --build launcher/build --config Release`, then run
+   `launcher\build\Release\recomp_launcher.exe`.)
+2. Run `mm3_launcher.exe`. It opens on the **Setup** page.
 3. Choose your disc image (*Disc image…*, an XISO or a full dump) or the folder of an already extracted disc
    (*Folder…*, linked as `game_files\` with a directory junction), and press **Run setup**.
 
-It checks for Git, Python with capstone, CMake and Visual Studio. It then extracts the disc into
-`game_files\` and checks `default.xbe` against the SHA-1 below. Finally it fetches the toolkit submodule and
-runs `regen_once.ps1`. Its output shows in the window and goes to `setup.log`. When it finishes, press
-**Play**. The build has also put `mm3_launcher.exe` in the repository root; use that one from now on.
+It checks for Git, Python, capstone, CMake and Visual Studio. If any are missing, it offers to install them
+with winget, which can take a while (Visual Studio especially). It then extracts the disc into
+`game_files\` and checks `default.xbe` against the SHA-1 below. Finally it fetches the toolkit submodule if
+needed and runs `regen_once.ps1` (about 17 minutes). A progress bar and the output show in the window, and the
+output also goes to `setup.log`. When it finishes, press **Play**.
+
+A new release is built by pushing a `v*` tag (`.github/workflows/release.yml`).
 
 ## Getting the game files
 

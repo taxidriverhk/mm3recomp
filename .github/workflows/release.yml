@@ -1,0 +1,67 @@
+# Packages a Windows release on every v* tag (or by hand, as a build artifact): the source as a shallow
+# clone with its submodules, plus mm3_launcher.exe at the root. No game content and nothing built from it:
+# players unzip it, run the launcher, and its Setup page builds the game from their own disc.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NAME: mm3recomp
+  LAUNCHER: mm3_launcher
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      # Kept as a real git checkout: setup applies the toolkit/SDK patches with git.
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.NAME }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Build the launcher
+        run: |
+          cmake -S "$env:NAME/launcher" -B launcher-build -A x64
+          cmake --build launcher-build --config Release
+          Copy-Item launcher-build/Release/recomp_launcher.exe "$env:NAME/$env:LAUNCHER.exe"
+
+      - name: Zip
+        id: zip
+        run: |
+          $ver = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
+          $zip = "$env:NAME-$ver-windows.zip"
+          # 7z keeps the hidden .git folders that Compress-Archive leaves out.
+          7z a -tzip $zip $env:NAME | Out-Null
+          if ($LASTEXITCODE) { exit 1 }
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          @"
+          Midtown Madness 3 static recompilation for Windows (x64), $ver.
+
+          **No game content is included.** You need your own copy of the game.
+
+          1. Unzip this anywhere (a short path such as ``C:\Games`` avoids long-path trouble).
+          2. Run ``$env:NAME\$env:LAUNCHER.exe``. It opens on the Setup page.
+          3. Choose your disc image (.iso) or a folder with the extracted disc, and press **Run setup**.
+             Missing build tools are offered for installation with winget. The first build takes 20-30 minutes.
+          4. Press **Play**.
+
+          See README.md for details.
+          "@ | Set-Content notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-windows
+          path: ${{ steps.zip.outputs.zip }}
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$env:GITHUB_REF_NAME" "${{ steps.zip.outputs.zip }}" --repo "$env:GITHUB_REPOSITORY" --title "$env:GITHUB_REF_NAME" --notes-file notes.md
